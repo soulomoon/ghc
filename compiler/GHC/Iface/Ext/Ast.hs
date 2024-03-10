@@ -633,12 +633,7 @@ tyThingSemantic ty = case ty of
   AConLike con -> case con of
     RealDataCon _ -> S.singleton TDataConstructor
     PatSynCon _   -> S.singleton TPatternSynonym
-  ATyCon tyCon
-    | isTypeSynonymTyCon tyCon -> S.singleton TTypeSynonym
-    | isTypeFamilyTyCon tyCon ->S.singleton TTypeFamily
-    | isClassTyCon tyCon -> S.singleton TClass
-    -- fall back to TTypeConstructor the result
-    | otherwise -> S.singleton TTypeConstructor
+  ATyCon tyCon -> S.fromList $ [TTypeSynonym | isTypeSynonymTyCon tyCon] <> [TTypeFamily | isTypeFamilyTyCon tyCon] <> [TClass | isClassTyCon tyCon] <> [TTypeConstructor]
   ACoAxiom _ -> S.empty
 
 expandTypeSyn :: Type -> Type
