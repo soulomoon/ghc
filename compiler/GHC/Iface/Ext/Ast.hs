@@ -32,25 +32,25 @@ import GHC.Data.Bag               ( Bag, bagToList )
 import GHC.Types.Basic
 import GHC.Data.BooleanFormula
 import GHC.Core.Class             ( className, classSCSelIds )
-import GHC.Core.ConLike           ( conLikeName )
-import GHC.Core.TyCon             ( TyCon, tyConClass_maybe )
+import GHC.Core.ConLike           ( conLikeName, ConLike (..) )
+import GHC.Core.TyCon             ( TyCon, tyConClass_maybe, isTypeSynonymTyCon, isTypeFamilyTyCon, isClassTyCon )
 import GHC.Core.FVs
 import GHC.Core.DataCon           ( dataConNonlinearType )
 import GHC.Types.FieldLabel
 import GHC.Hs
 import GHC.Hs.Syn.Type
 import GHC.Utils.Monad            ( concatMapM, MonadIO(liftIO) )
-import GHC.Types.Id               ( isDataConId_maybe )
+import GHC.Types.Id               ( isDataConId_maybe, isRecordSelector, isClassOpId )
 import GHC.Types.Name             ( Name, nameSrcSpan, nameUnique )
 import GHC.Types.Name.Env         ( NameEnv, emptyNameEnv, extendNameEnv, lookupNameEnv )
 import GHC.Types.Name.Reader      ( RecFieldInfo(..) )
 import GHC.Types.SrcLoc
-import GHC.Core.Type              ( Type )
+import GHC.Core.Type              ( Type, coreView, isFunTy )
 import GHC.Core.Predicate
 import GHC.Core.InstEnv
 import GHC.Tc.Types
 import GHC.Tc.Types.Evidence
-import GHC.Types.Var              ( Id, Var, EvId, varName, varType, varUnique )
+import GHC.Types.Var              ( Id, Var, EvId, varName, varType, varUnique, isVisibleFunArg )
 import GHC.Types.Var.Env
 import GHC.Builtin.Uniques
 import GHC.Iface.Make             ( mkIfaceExports )
@@ -81,6 +81,10 @@ import Control.Monad.Trans.State.Strict
 import Control.Monad.Trans.Reader
 import Control.Monad.Trans.Class  ( lift )
 import Control.Applicative        ( (<|>) )
+import GHC.Types.TyThing (TyThing (..))
+import GHC.Core.TyCo.Rep (Kind, Type (ForAllTy, FunTy, ft_af, ft_res))
+import GHC.Types.TypeEnv (TypeEnv)
+import Data.Monoid ((<>))
 
 {- Note [Updating HieAst for changes in the GHC AST]
    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -225,6 +229,7 @@ type VarMap a = DVarEnv (Var,a)
 data HieState = HieState
   { name_remapping :: NameEnv Id
   , unlocated_ev_binds :: VarMap (S.Set ContextInfo)
+  , type_env :: TypeEnv
   -- These contain evidence bindings that we don't have a location for
   -- These are placed at the top level Node in the HieAST after everything
   -- else has been generated
@@ -246,7 +251,7 @@ getUnlocatedEvBinds file = do
   org <- ask
   let elts = dVarEnvElts binds
 
-      mkNodeInfo (n,ci) = (Right (varName n), IdentifierDetails (Just $ varType n) ci)
+      mkNodeInfo (n,ci) = (Right (varName n), IdentifierDetails (Just $ varType n) ci S.empty)
 
       go e@(v,_) (xs,ys) = case nameSrcSpan $ varName v of
         RealSrcSpan spn _
@@ -261,7 +266,7 @@ getUnlocatedEvBinds file = do
   pure $ (M.fromList nis, asts)
 
 initState :: HieState
-initState = HieState emptyNameEnv emptyDVarEnv
+initState = HieState emptyNameEnv emptyDVarEnv mempty
 
 class ModifyState a where -- See Note [Name Remapping]
   addSubstitution :: a -> a -> HieState -> HieState
@@ -302,6 +307,7 @@ mkHieFileWithSource src_file src ms ts rs =
   let tc_binds = tcg_binds ts
       top_ev_binds = tcg_ev_binds ts
       insts = tcg_insts ts
+      tte = tcg_type_env ts
       tcs = tcg_tcs ts
       (asts',arr) = getCompressedAsts tc_binds rs top_ev_binds insts tcs in
   HieFile
@@ -619,6 +625,43 @@ instance ToHie (Context (Located a)) => ToHie (Context (LocatedN a)) where
 instance ToHie (Context (Located a)) => ToHie (Context (LocatedA a)) where
   toHie (C c (L l a)) = toHie (C c (L (locA l) a))
 
+idSemantic :: Id -> S.Set HsSemanticTokenType
+idSemantic vid = S.fromList $ [TVariable | isFunVar vid] <> [TFunction | isFunVar vid] <> [TRecordField | isRecordSelector vid] <> [TClassMethod | isClassOpId vid] <> [TVariable]
+tyThingSemantic :: TyThing -> S.Set HsSemanticTokenType
+tyThingSemantic ty = case ty of
+  AnId vid -> idSemantic vid
+  AConLike con -> case con of
+    RealDataCon _ -> S.singleton TDataConstructor
+    PatSynCon _   -> S.singleton TPatternSynonym
+  ATyCon tyCon
+    | isTypeSynonymTyCon tyCon -> S.singleton TTypeSynonym
+    | isTypeFamilyTyCon tyCon ->S.singleton TTypeFamily
+    | isClassTyCon tyCon -> S.singleton TClass
+    -- fall back to TTypeConstructor the result
+    | otherwise -> S.singleton TTypeConstructor
+  ACoAxiom _ -> S.empty
+
+expandTypeSyn :: Type -> Type
+expandTypeSyn ty
+  | Just ty' <- coreView ty = expandTypeSyn ty'
+  | otherwise               = ty
+
+isFunVar :: Var -> Bool
+isFunVar var = isFunType $ varType var
+
+isFunType :: Type -> Bool
+isFunType a = case expandTypeSyn a of
+  ForAllTy _ t    -> isFunType t
+  --   Development.IDE.GHC.Compat.Core.FunTy(pattern synonym), FunTyFlag which is used to distinguish
+  --   (->, =>, etc..)
+  FunTy { ft_af = flg, ft_res = rhs } -> isVisibleFunArg flg || isFunType rhs
+  _x              -> isFunTy a
+
+lookUpTyThing :: Name -> HieM (Maybe TyThing)
+lookUpTyThing v = do
+  m <- lift $ gets type_env
+  pure $ lookupNameEnv m v
+
 instance ToHie (Context (Located Var)) where
   toHie c = case c of
       C context (L (RealSrcSpan span _) name')
@@ -638,7 +681,8 @@ instance ToHie (Context (Located Var)) where
               (mkSourcedNodeInfo org $ NodeInfo S.empty [] $
                 M.singleton (Right $ varName name)
                             (IdentifierDetails (Just ty)
-                                               (S.singleton context)))
+                                               (S.singleton context)
+                                               (idSemantic name)))
               span
               []]
       C (EvidenceVarBind i _ sp)  (L _ name) -> do
@@ -657,12 +701,16 @@ instance ToHie (Context (Located Name)) where
           let name = case lookupNameEnv m name' of
                 Just var -> varName var
                 Nothing -> name'
+          tyThing <- lookUpTyThing name
           pure
             [Node
               (mkSourcedNodeInfo org $ NodeInfo S.empty [] $
                 M.singleton (Right name)
                             (IdentifierDetails Nothing
-                                               (S.singleton context)))
+                                               (S.singleton context)
+                                               (case tyThing of
+                                                  Nothing -> S.empty
+                                                  Just x -> tyThingSemantic x)))
               span
               []]
       _ -> pure []

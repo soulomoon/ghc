@@ -41,12 +41,29 @@ import Control.Applicative        ( (<|>) )
 import Data.Coerce                ( coerce  )
 import Data.Function              ( on )
 import qualified Data.Semigroup as S
+import GHC.Generics (Generic)
 
 type Span = RealSrcSpan
 
 -- | Current version of @.hie@ files
 hieVersion :: Integer
 hieVersion = read (cProjectVersionInt ++ cProjectPatchLevel) :: Integer
+
+data HsSemanticTokenType
+  = TVariable -- none function variable
+  | TFunction -- function
+  | TDataConstructor -- Data constructor
+  | TTypeVariable -- Type variable
+  | TClassMethod -- Class method
+  | TPatternSynonym -- Pattern synonym
+  | TTypeConstructor -- Type (Type constructor)
+  | TClass -- Type class
+  | TTypeSynonym -- Type synonym
+  | TTypeFamily -- type family
+  | TRecordField -- from match bind
+  | TOperator-- operator
+  | TModule -- module name
+  deriving (Eq, Ord, Show, Enum, Bounded, Generic)
 
 {- |
 GHC builds up a wealth of information about Haskell source as it compiles it.
@@ -371,17 +388,35 @@ type NodeIdentifiers a = M.Map Identifier (IdentifierDetails a)
 data IdentifierDetails a = IdentifierDetails
   { identType :: Maybe a
   , identInfo :: S.Set ContextInfo
+  , identSemantic :: S.Set HsSemanticTokenType
   } deriving (Eq, Functor, Foldable, Traversable)
 
+
+instance Outputable HsSemanticTokenType where
+  ppr TVariable = text "variable"
+  ppr TFunction = text "function"
+  ppr TDataConstructor = text "data constructor"
+  ppr TTypeVariable = text "type variable"
+  ppr TClassMethod = text "class method"
+  ppr TPatternSynonym = text "pattern synonym"
+  ppr TTypeConstructor = text "type constructor"
+  ppr TClass = text "type class"
+  ppr TTypeSynonym = text "type synonym"
+  ppr TTypeFamily = text "type family"
+  ppr TRecordField = text "record field"
+  ppr TOperator = text "operator"
+  ppr TModule = text "module name"
+
 instance Outputable a => Outputable (IdentifierDetails a) where
-  ppr x = text "Details: " <+> ppr (identType x) <+> ppr (identInfo x)
+  ppr x = text "Details: " <+> ppr (identType x) <+> ppr (identInfo x) <+> ppr (identSemantic x)
 
 instance Semigroup (IdentifierDetails a) where
   d1 <> d2 = IdentifierDetails (identType d1 <|> identType d2)
                                (S.union (identInfo d1) (identInfo d2))
+                               (S.union (identSemantic d1) (identSemantic d2))
 
 instance Monoid (IdentifierDetails a) where
-  mempty = IdentifierDetails Nothing S.empty
+  mempty = IdentifierDetails Nothing S.empty S.empty
 
 instance Binary (IdentifierDetails TypeIndex) where
   put_ bh dets = do
@@ -390,6 +425,7 @@ instance Binary (IdentifierDetails TypeIndex) where
   get bh =  IdentifierDetails
     <$> get bh
     <*> fmap S.fromDistinctAscList (get bh)
+    <*> pure S.empty
 
 
 -- | Different contexts under which identifiers exist
