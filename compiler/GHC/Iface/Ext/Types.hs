@@ -49,7 +49,7 @@ type Span = RealSrcSpan
 hieVersion :: Integer
 hieVersion = read (cProjectVersionInt ++ cProjectPatchLevel) :: Integer
 
-data HsSemanticTokenType
+data EntityInfo
   = TVariable -- none function variable
   | TFunction -- function
   | TDataConstructor -- Data constructor
@@ -61,8 +61,6 @@ data HsSemanticTokenType
   | TTypeSynonym -- Type synonym
   | TTypeFamily -- type family
   | TRecordField -- from match bind
-  | TOperator-- operator
-  | TModule -- module name
   deriving (Eq, Ord, Show, Enum, Bounded, Generic)
 
 {- |
@@ -388,11 +386,11 @@ type NodeIdentifiers a = M.Map Identifier (IdentifierDetails a)
 data IdentifierDetails a = IdentifierDetails
   { identType :: Maybe a
   , identInfo :: S.Set ContextInfo
-  , identSemantic :: S.Set HsSemanticTokenType
+  , identSemantic :: S.Set EntityInfo
   } deriving (Eq, Functor, Foldable, Traversable)
 
 
-instance Outputable HsSemanticTokenType where
+instance Outputable EntityInfo where
   ppr TVariable = text "variable"
   ppr TFunction = text "function"
   ppr TDataConstructor = text "data constructor"
@@ -404,8 +402,6 @@ instance Outputable HsSemanticTokenType where
   ppr TTypeSynonym = text "type synonym"
   ppr TTypeFamily = text "type family"
   ppr TRecordField = text "record field"
-  ppr TOperator = text "operator"
-  ppr TModule = text "module name"
 
 instance Outputable a => Outputable (IdentifierDetails a) where
   ppr x = text "Details: " <+> ppr (identType x) <+> ppr (identInfo x) <+> ppr (identSemantic x)

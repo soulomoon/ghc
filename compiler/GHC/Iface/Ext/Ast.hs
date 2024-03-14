@@ -33,7 +33,7 @@ import GHC.Types.Basic
 import GHC.Data.BooleanFormula
 import GHC.Core.Class             ( className, classSCSelIds )
 import GHC.Core.ConLike           ( conLikeName, ConLike (..) )
-import GHC.Core.TyCon             ( TyCon, tyConClass_maybe, isTypeSynonymTyCon, isTypeFamilyTyCon, isClassTyCon )
+import GHC.Core.TyCon             ( TyCon, tyConClass_maybe, isTypeSynonymTyCon, isClassTyCon, isFamilyTyCon )
 import GHC.Core.FVs
 import GHC.Core.DataCon           ( dataConNonlinearType )
 import GHC.Types.FieldLabel
@@ -41,11 +41,11 @@ import GHC.Hs
 import GHC.Hs.Syn.Type
 import GHC.Utils.Monad            ( concatMapM, MonadIO(liftIO) )
 import GHC.Types.Id               ( isDataConId_maybe, isRecordSelector, isClassOpId )
-import GHC.Types.Name             ( Name, nameSrcSpan, nameUnique )
+import GHC.Types.Name             ( Name, nameSrcSpan, nameUnique, wiredInNameTyThing_maybe )
 import GHC.Types.Name.Env         ( NameEnv, emptyNameEnv, extendNameEnv, lookupNameEnv )
 import GHC.Types.Name.Reader      ( RecFieldInfo(..) )
 import GHC.Types.SrcLoc
-import GHC.Core.Type              ( Type, coreView, isFunTy )
+import GHC.Core.Type              ( Type, coreView, isFunTy, isTyVar, coreFullView )
 import GHC.Core.Predicate
 import GHC.Core.InstEnv
 import GHC.Tc.Types
@@ -309,7 +309,7 @@ mkHieFileWithSource src_file src ms ts rs =
       insts = tcg_insts ts
       tte = tcg_type_env ts
       tcs = tcg_tcs ts
-      (asts',arr) = getCompressedAsts tc_binds rs top_ev_binds insts tcs in
+      (asts',arr) = getCompressedAsts tc_binds rs top_ev_binds insts tcs tte in
   HieFile
       { hie_hs_file = src_file
       , hie_module = ms_mod ms
@@ -320,16 +320,17 @@ mkHieFileWithSource src_file src ms ts rs =
       , hie_hs_src = src
       }
 
-getCompressedAsts :: TypecheckedSource -> RenamedSource -> Bag EvBind -> [ClsInst] -> [TyCon]
+getCompressedAsts :: TypecheckedSource -> RenamedSource -> Bag EvBind -> [ClsInst] -> [TyCon] -> TypeEnv
   -> (HieASTs TypeIndex, A.Array TypeIndex HieTypeFlat)
-getCompressedAsts ts rs top_ev_binds insts tcs =
-  let asts = enrichHie ts rs top_ev_binds insts tcs in
+getCompressedAsts ts rs top_ev_binds insts tcs tte =
+  let asts = enrichHie ts rs top_ev_binds insts tcs tte in
   compressTypes asts
 
-enrichHie :: TypecheckedSource -> RenamedSource -> Bag EvBind -> [ClsInst] -> [TyCon]
+enrichHie :: TypecheckedSource -> RenamedSource -> Bag EvBind -> [ClsInst] -> [TyCon] -> TypeEnv
   -> HieASTs Type
-enrichHie ts (hsGrp, imports, exports, docs, modName) ev_bs insts tcs =
-  runIdentity $ flip evalStateT initState $ flip runReaderT SourceInfo $ do
+enrichHie ts (hsGrp, imports, exports, docs, modName) ev_bs insts tcs tte =
+  runIdentity $ flip evalStateT initState{type_env=tte} $ flip runReaderT SourceInfo $ do
+
     modName <- toHie (IEC Export <$> modName)
     tasts <- toHie $ fmap (BC RegularBind ModuleScope) ts
     rasts <- processGrp hsGrp
@@ -625,37 +626,32 @@ instance ToHie (Context (Located a)) => ToHie (Context (LocatedN a)) where
 instance ToHie (Context (Located a)) => ToHie (Context (LocatedA a)) where
   toHie (C c (L l a)) = toHie (C c (L (locA l) a))
 
-idSemantic :: Id -> S.Set HsSemanticTokenType
-idSemantic vid = S.fromList $ [TVariable | isFunVar vid] <> [TFunction | isFunVar vid] <> [TRecordField | isRecordSelector vid] <> [TClassMethod | isClassOpId vid] <> [TVariable]
-tyThingSemantic :: TyThing -> S.Set HsSemanticTokenType
-tyThingSemantic ty = case ty of
-  AnId vid -> idSemantic vid
+idEntityInfo :: Id -> S.Set EntityInfo
+idEntityInfo vid = S.fromList $  [TTypeVariable | isTyVar vid] <> [TFunction | isFunVar vid] <> [TRecordField | isRecordSelector vid] <> [TClassMethod | isClassOpId vid] <> [TVariable]
+
+tyThingEntityInfo :: TyThing -> S.Set EntityInfo
+tyThingEntityInfo ty = case ty of
+  AnId vid -> idEntityInfo vid
   AConLike con -> case con of
     RealDataCon _ -> S.singleton TDataConstructor
     PatSynCon _   -> S.singleton TPatternSynonym
-  ATyCon tyCon -> S.fromList $ [TTypeSynonym | isTypeSynonymTyCon tyCon] <> [TTypeFamily | isTypeFamilyTyCon tyCon] <> [TClass | isClassTyCon tyCon] <> [TTypeConstructor]
+  ATyCon tyCon -> S.fromList $ [TTypeSynonym | isTypeSynonymTyCon tyCon] <> [TTypeFamily | isFamilyTyCon tyCon] <> [TClass | isClassTyCon tyCon] <> [TTypeConstructor]
   ACoAxiom _ -> S.empty
 
-expandTypeSyn :: Type -> Type
-expandTypeSyn ty
-  | Just ty' <- coreView ty = expandTypeSyn ty'
-  | otherwise               = ty
 
 isFunVar :: Var -> Bool
 isFunVar var = isFunType $ varType var
 
 isFunType :: Type -> Bool
-isFunType a = case expandTypeSyn a of
+isFunType a = case coreFullView a of
   ForAllTy _ t    -> isFunType t
-  --   Development.IDE.GHC.Compat.Core.FunTy(pattern synonym), FunTyFlag which is used to distinguish
-  --   (->, =>, etc..)
   FunTy { ft_af = flg, ft_res = rhs } -> isVisibleFunArg flg || isFunType rhs
   _x              -> isFunTy a
 
 lookUpTyThing :: Name -> HieM (Maybe TyThing)
 lookUpTyThing v = do
   m <- lift $ gets type_env
-  pure $ lookupNameEnv m v
+  pure $ lookupNameEnv m v <|> wiredInNameTyThing_maybe v
 
 instance ToHie (Context (Located Var)) where
   toHie c = case c of
@@ -677,7 +673,7 @@ instance ToHie (Context (Located Var)) where
                 M.singleton (Right $ varName name)
                             (IdentifierDetails (Just ty)
                                                (S.singleton context)
-                                               (idSemantic name)))
+                                               (idEntityInfo name)))
               span
               []]
       C (EvidenceVarBind i _ sp)  (L _ name) -> do
@@ -703,9 +699,7 @@ instance ToHie (Context (Located Name)) where
                 M.singleton (Right name)
                             (IdentifierDetails Nothing
                                                (S.singleton context)
-                                               (case tyThing of
-                                                  Nothing -> S.empty
-                                                  Just x -> tyThingSemantic x)))
+                                               (maybe S.empty tyThingEntityInfo tyThing)))
               span
               []]
       _ -> pure []
@@ -2285,3 +2279,4 @@ instance ToHie (LocatedA (DocDecl GhcRn)) where
 instance ToHie (LHsDoc GhcRn) where
   toHie (L span d@(WithHsDocIdentifiers _ ids)) =
     concatM $ makeNode d span : [toHie $ map (C Use) ids]
+
