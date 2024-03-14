@@ -32,25 +32,25 @@ import GHC.Data.Bag               ( Bag, bagToList )
 import GHC.Types.Basic
 import GHC.Data.BooleanFormula
 import GHC.Core.Class             ( className, classSCSelIds )
-import GHC.Core.ConLike           ( conLikeName )
-import GHC.Core.TyCon             ( TyCon, tyConClass_maybe )
+import GHC.Core.ConLike           ( conLikeName, ConLike (..) )
+import GHC.Core.TyCon             ( TyCon, tyConClass_maybe, isTypeSynonymTyCon, isClassTyCon, isFamilyTyCon )
 import GHC.Core.FVs
 import GHC.Core.DataCon           ( dataConNonlinearType )
 import GHC.Types.FieldLabel
 import GHC.Hs
 import GHC.Hs.Syn.Type
 import GHC.Utils.Monad            ( concatMapM, MonadIO(liftIO) )
-import GHC.Types.Id               ( isDataConId_maybe )
-import GHC.Types.Name             ( Name, nameSrcSpan, nameUnique )
+import GHC.Types.Id               ( isDataConId_maybe, isRecordSelector, isClassOpId )
+import GHC.Types.Name             ( Name, nameSrcSpan, nameUnique, wiredInNameTyThing_maybe )
 import GHC.Types.Name.Env         ( NameEnv, emptyNameEnv, extendNameEnv, lookupNameEnv )
 import GHC.Types.Name.Reader      ( RecFieldInfo(..) )
 import GHC.Types.SrcLoc
-import GHC.Core.Type              ( Type )
+import GHC.Core.Type              ( Type, coreView, isFunTy, isTyVar, coreFullView )
 import GHC.Core.Predicate
 import GHC.Core.InstEnv
 import GHC.Tc.Types
 import GHC.Tc.Types.Evidence
-import GHC.Types.Var              ( Id, Var, EvId, varName, varType, varUnique )
+import GHC.Types.Var              ( Id, Var, EvId, varName, varType, varUnique, isVisibleFunArg )
 import GHC.Types.Var.Env
 import GHC.Builtin.Uniques
 import GHC.Iface.Make             ( mkIfaceExports )
@@ -81,6 +81,10 @@ import Control.Monad.Trans.State.Strict
 import Control.Monad.Trans.Reader
 import Control.Monad.Trans.Class  ( lift )
 import Control.Applicative        ( (<|>) )
+import GHC.Types.TyThing (TyThing (..))
+import GHC.Core.TyCo.Rep (Kind, Type (ForAllTy, FunTy, ft_af, ft_res))
+import GHC.Types.TypeEnv (TypeEnv)
+import Data.Monoid ((<>))
 
 {- Note [Updating HieAst for changes in the GHC AST]
    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -225,6 +229,7 @@ type VarMap a = DVarEnv (Var,a)
 data HieState = HieState
   { name_remapping :: NameEnv Id
   , unlocated_ev_binds :: VarMap (S.Set ContextInfo)
+  , type_env :: TypeEnv
   -- These contain evidence bindings that we don't have a location for
   -- These are placed at the top level Node in the HieAST after everything
   -- else has been generated
@@ -246,7 +251,7 @@ getUnlocatedEvBinds file = do
   org <- ask
   let elts = dVarEnvElts binds
 
-      mkNodeInfo (n,ci) = (Right (varName n), IdentifierDetails (Just $ varType n) ci)
+      mkNodeInfo (n,ci) = (Right (varName n), IdentifierDetails (Just $ varType n) ci S.empty)
 
       go e@(v,_) (xs,ys) = case nameSrcSpan $ varName v of
         RealSrcSpan spn _
@@ -261,7 +266,7 @@ getUnlocatedEvBinds file = do
   pure $ (M.fromList nis, asts)
 
 initState :: HieState
-initState = HieState emptyNameEnv emptyDVarEnv
+initState = HieState emptyNameEnv emptyDVarEnv mempty
 
 class ModifyState a where -- See Note [Name Remapping]
   addSubstitution :: a -> a -> HieState -> HieState
@@ -302,8 +307,9 @@ mkHieFileWithSource src_file src ms ts rs =
   let tc_binds = tcg_binds ts
       top_ev_binds = tcg_ev_binds ts
       insts = tcg_insts ts
+      tte = tcg_type_env ts
       tcs = tcg_tcs ts
-      (asts',arr) = getCompressedAsts tc_binds rs top_ev_binds insts tcs in
+      (asts',arr) = getCompressedAsts tc_binds rs top_ev_binds insts tcs tte in
   HieFile
       { hie_hs_file = src_file
       , hie_module = ms_mod ms
@@ -314,16 +320,17 @@ mkHieFileWithSource src_file src ms ts rs =
       , hie_hs_src = src
       }
 
-getCompressedAsts :: TypecheckedSource -> RenamedSource -> Bag EvBind -> [ClsInst] -> [TyCon]
+getCompressedAsts :: TypecheckedSource -> RenamedSource -> Bag EvBind -> [ClsInst] -> [TyCon] -> TypeEnv
   -> (HieASTs TypeIndex, A.Array TypeIndex HieTypeFlat)
-getCompressedAsts ts rs top_ev_binds insts tcs =
-  let asts = enrichHie ts rs top_ev_binds insts tcs in
+getCompressedAsts ts rs top_ev_binds insts tcs tte =
+  let asts = enrichHie ts rs top_ev_binds insts tcs tte in
   compressTypes asts
 
-enrichHie :: TypecheckedSource -> RenamedSource -> Bag EvBind -> [ClsInst] -> [TyCon]
+enrichHie :: TypecheckedSource -> RenamedSource -> Bag EvBind -> [ClsInst] -> [TyCon] -> TypeEnv
   -> HieASTs Type
-enrichHie ts (hsGrp, imports, exports, docs, modName) ev_bs insts tcs =
-  runIdentity $ flip evalStateT initState $ flip runReaderT SourceInfo $ do
+enrichHie ts (hsGrp, imports, exports, docs, modName) ev_bs insts tcs tte =
+  runIdentity $ flip evalStateT initState{type_env=tte} $ flip runReaderT SourceInfo $ do
+
     modName <- toHie (IEC Export <$> modName)
     tasts <- toHie $ fmap (BC RegularBind ModuleScope) ts
     rasts <- processGrp hsGrp
@@ -619,6 +626,33 @@ instance ToHie (Context (Located a)) => ToHie (Context (LocatedN a)) where
 instance ToHie (Context (Located a)) => ToHie (Context (LocatedA a)) where
   toHie (C c (L l a)) = toHie (C c (L (locA l) a))
 
+idEntityInfo :: Id -> S.Set EntityInfo
+idEntityInfo vid = S.fromList $  [TTypeVariable | isTyVar vid] <> [TFunction | isFunVar vid] <> [TRecordField | isRecordSelector vid] <> [TClassMethod | isClassOpId vid] <> [TVariable]
+
+tyThingEntityInfo :: TyThing -> S.Set EntityInfo
+tyThingEntityInfo ty = case ty of
+  AnId vid -> idEntityInfo vid
+  AConLike con -> case con of
+    RealDataCon _ -> S.singleton TDataConstructor
+    PatSynCon _   -> S.singleton TPatternSynonym
+  ATyCon tyCon -> S.fromList $ [TTypeSynonym | isTypeSynonymTyCon tyCon] <> [TTypeFamily | isFamilyTyCon tyCon] <> [TClass | isClassTyCon tyCon] <> [TTypeConstructor]
+  ACoAxiom _ -> S.empty
+
+
+isFunVar :: Var -> Bool
+isFunVar var = isFunType $ varType var
+
+isFunType :: Type -> Bool
+isFunType a = case coreFullView a of
+  ForAllTy _ t    -> isFunType t
+  FunTy { ft_af = flg, ft_res = rhs } -> isVisibleFunArg flg || isFunType rhs
+  _x              -> isFunTy a
+
+lookUpTyThing :: Name -> HieM (Maybe TyThing)
+lookUpTyThing v = do
+  m <- lift $ gets type_env
+  pure $ lookupNameEnv m v <|> wiredInNameTyThing_maybe v
+
 instance ToHie (Context (Located Var)) where
   toHie c = case c of
       C context (L (RealSrcSpan span _) name')
@@ -638,7 +672,8 @@ instance ToHie (Context (Located Var)) where
               (mkSourcedNodeInfo org $ NodeInfo S.empty [] $
                 M.singleton (Right $ varName name)
                             (IdentifierDetails (Just ty)
-                                               (S.singleton context)))
+                                               (S.singleton context)
+                                               (idEntityInfo name)))
               span
               []]
       C (EvidenceVarBind i _ sp)  (L _ name) -> do
@@ -657,12 +692,14 @@ instance ToHie (Context (Located Name)) where
           let name = case lookupNameEnv m name' of
                 Just var -> varName var
                 Nothing -> name'
+          tyThing <- lookUpTyThing name
           pure
             [Node
               (mkSourcedNodeInfo org $ NodeInfo S.empty [] $
                 M.singleton (Right name)
                             (IdentifierDetails Nothing
-                                               (S.singleton context)))
+                                               (S.singleton context)
+                                               (maybe S.empty tyThingEntityInfo tyThing)))
               span
               []]
       _ -> pure []
@@ -2242,3 +2279,4 @@ instance ToHie (LocatedA (DocDecl GhcRn)) where
 instance ToHie (LHsDoc GhcRn) where
   toHie (L span d@(WithHsDocIdentifiers _ ids)) =
     concatM $ makeNode d span : [toHie $ map (C Use) ids]
+
