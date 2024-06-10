@@ -57,7 +57,7 @@ diffAst diffType (Node info1 span1 xs1) (Node info2 span2 xs2) =
                          ++ eqDiff b d
     diffName (Right a) (Right b) = case (a,b) of
       (ExternalName m o _, ExternalName m' o' _) -> eqDiff (m,o) (m',o')
-      (LocalName o _, ExternalName _ o' _) -> eqDiff o o'
+      (LocalName _ o _, ExternalName _ o' _) -> eqDiff o o'
       _ -> eqDiff a b
     diffName a b = eqDiff a b
 

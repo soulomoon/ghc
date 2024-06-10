@@ -648,7 +648,8 @@ instance ToHie (Context (Located Var)) where
                       Nothing -> varType name'
                       Just dc -> dataConNonlinearType dc
           -- insert the entity info for the name into the entity_infos map
-          insertEntityInfo (Right $ varName name) $ idEntityInfo name'
+          insertEntityInfo (Right $ varName name) $ idEntityInfo name
+          insertEntityInfo (Right $ varName name') $ idEntityInfo name'
           pure
             [Node
               (mkSourcedNodeInfo org $ NodeInfo S.empty [] $
@@ -674,8 +675,10 @@ instance ToHie (Context (Located Name)) where
                 Just var -> varName var
                 Nothing -> name'
           tyThing <- hieLookupTyThing name
+          tyThing' <- hieLookupTyThing name'
           -- insert the entity info for the name into the entity_infos map
           insertEntityInfo (Right name) $ maybe (nameEntityInfo name) tyThingEntityInfo tyThing
+          insertEntityInfo (Right name') $ maybe (nameEntityInfo name') tyThingEntityInfo tyThing'
           pure
             [Node
               (mkSourcedNodeInfo org $ NodeInfo S.empty [] $

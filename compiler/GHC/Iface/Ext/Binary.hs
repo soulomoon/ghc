@@ -265,7 +265,7 @@ putName (HieSymbolTable next ref) bh name = do
       let hieName = ExternalName mod occ (nameSrcSpan name)
       writeIORef ref $! addToUFM symmap name (off, hieName)
       put_ bh (fromIntegral off :: Word32)
-    Just (off, LocalName _occ span)
+    Just (off, LocalName _u _occ span)
       | notLocal (toHieName name) || nameSrcSpan name /= span -> do
       writeIORef ref $! addToUFM symmap name (off, toHieName name)
       put_ bh (fromIntegral off :: Word32)
@@ -297,9 +297,7 @@ fromHieName nc hie_name = do
               new_cache  = extendOrigNameCache cache mod occ name
           pure (new_cache, name)
 
-    LocalName occ span -> do
-      uniq <- takeUniqFromNameCache nc
-      -- don't update the NameCache for local names
+    LocalName uniq occ span -> do
       pure $ mkInternalName uniq occ span
 
     KnownKeyName u -> case lookupKnownKeyName u of
@@ -313,9 +311,9 @@ putHieName :: WriteBinHandle -> HieName -> IO ()
 putHieName bh (ExternalName mod occ span) = do
   putByte bh 0
   put_ bh (mod, occ, BinSrcSpan span)
-putHieName bh (LocalName occName span) = do
+putHieName bh (LocalName u occName span) = do
   putByte bh 1
-  put_ bh (occName, BinSrcSpan span)
+  put_ bh (unpkUnique u, occName, BinSrcSpan span)
 putHieName bh (KnownKeyName uniq) = do
   putByte bh 2
   put_ bh $ unpkUnique uniq
@@ -328,8 +326,8 @@ getHieName bh = do
       (modu, occ, span) <- get bh
       return $ ExternalName modu occ $ unBinSrcSpan span
     1 -> do
-      (occ, span) <- get bh
-      return $ LocalName occ $ unBinSrcSpan span
+      ((c,i), occ, span) <- get bh
+      return $ LocalName (mkUnique c i) occ $ unBinSrcSpan span
     2 -> do
       (c,i) <- get bh
       return $ KnownKeyName $ mkUnique c i
