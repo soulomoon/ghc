@@ -287,7 +287,6 @@ import Control.DeepSeq (force)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import GHC.Unit.Module.WholeCoreBindings
 import GHC.Types.TypeEnv
-import System.IO
 import {-# SOURCE #-} GHC.Driver.Pipeline
 import Data.Time
 
@@ -984,14 +983,26 @@ add_iface_to_hpt iface details =
 -- Knot tying!  See Note [Knot-tying typecheckIface]
 -- See Note [ModDetails and --make mode]
 initModDetails :: HscEnv -> ModIface -> IO ModDetails
-initModDetails hsc_env iface =
-  fixIO $ \details' -> do
-    add_iface_to_hpt iface details' hsc_env
+initModDetails hsc_env iface = do
     -- NB: This result is actually not that useful
     -- in one-shot mode, since we're not going to do
     -- any further typechecking.  It's much more useful
     -- in make mode, since this HMI will go into the HPT.
-    genModDetails hsc_env iface
+
+    -- A dummy ModDetails is inserted into the HPT as a placeholder
+    -- so that if anything tries to access the module’s details before
+    -- they are fully computed, an informative error is triggered.
+    -- Later the dummy is replaced with the real ModDetails.
+    -- This is to ensure any access to the ModDetails for current
+    -- module in `genModDetails` will be lazy. see #25903
+    add_iface_to_hpt iface
+      (pprPanic "initModDetails: premature access to ModDetail: "
+                (ppr $ mi_module iface))
+      hsc_env
+    details <- genModDetails hsc_env iface
+    add_iface_to_hpt iface details hsc_env
+    return details
+
 
 -- | Modify flags such that objects are compiled for the interpreter's way.
 -- This is necessary when building foreign objects for Template Haskell, since
