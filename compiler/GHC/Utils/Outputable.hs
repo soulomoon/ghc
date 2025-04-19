@@ -113,7 +113,7 @@ module GHC.Utils.Outputable (
 
         ifPprDebug, whenPprDebug, getPprDebug,
 
-        bPutHDoc
+        bPutHDoc, traceT
     ) where
 
 import Language.Haskell.Syntax.Module.Name ( ModuleName(..) )
@@ -164,6 +164,9 @@ import GHC.Fingerprint
 import GHC.Show         ( showMultiLineString )
 import GHC.Utils.Exception
 import GHC.Exts (oneShot)
+import Control.Concurrent (myThreadId)
+import Debug.Trace (traceM)
+import Control.Monad.IO.Class (MonadIO (liftIO))
 
 {-
 ************************************************************************
@@ -664,6 +667,11 @@ showSDocOneLine ctx d
 
 showSDocUnsafe :: SDoc -> String
 showSDocUnsafe sdoc = renderWithContext defaultSDocContext sdoc
+
+traceT :: (MonadIO m) => String -> m ()
+traceT msg = do
+  tid <- liftIO $ myThreadId
+  traceM $ "Thread " ++ show tid ++ ": " ++ msg
 
 showPprUnsafe :: Outputable a => a -> String
 showPprUnsafe a = renderWithContext defaultSDocContext (ppr a)

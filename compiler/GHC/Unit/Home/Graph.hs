@@ -87,6 +87,7 @@ import GHC.Data.Graph.Directed
 import GHC.Types.Annotations
 import GHC.Types.CompleteMatch
 import GHC.Core.InstEnv
+import Debug.Trace (traceM)
 
 
 -- | Get all 'CompleteMatches' (arising from COMPLETE pragmas) present across
@@ -252,8 +253,9 @@ lookupHug hug uid mod = do
 
 -- | Lookup the 'HomeModInfo' of a 'Module' in the 'HomeUnitGraph' (via the 'HomePackageTable' of the corresponding unit)
 lookupHugByModule :: Module -> HomeUnitGraph -> IO (Maybe HomeModInfo)
-lookupHugByModule mod hug
-  | otherwise = do
+lookupHugByModule mod hug = do
+  -- | otherwise = do
+      -- traceM $ "looking up " ++ showSDocUnsafe (ppr mod)
       case unitEnv_lookup_maybe (toUnitId $ moduleUnit mod) hug of
         Nothing -> pure Nothing
         Just env -> lookupHptByModule (homeUnitEnv_hpt env) mod

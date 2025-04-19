@@ -342,6 +342,10 @@ any missing cases.
 data ModuleNodeInfo = ModuleNodeFixed ModNodeKeyWithUid ModLocation
                     | ModuleNodeCompile ModSummary
 
+instance Outputable ModuleNodeInfo where
+  ppr (ModuleNodeFixed key loc) = text "ModuleNodeFixed: " <+> ppr key <+> ppr loc
+  ppr (ModuleNodeCompile ms) = text "ModuleNodeCompile: " <+> ppr (msKey ms) <+> ppr (ms_location ms)
+
 -- | Extract the Module from a ModuleNodeInfo
 moduleNodeInfoModule :: ModuleNodeInfo -> Module
 moduleNodeInfoModule (ModuleNodeFixed key _) = mnkToModule key

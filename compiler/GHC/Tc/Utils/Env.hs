@@ -115,7 +115,7 @@ import GHC.Unit.External
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Encoding
-import GHC.Utils.Misc ( HasDebugCallStack )
+import GHC.Utils.Misc ( HasDebugCallStack, HasCallStack )
 
 import GHC.Data.FastString
 import GHC.Data.List.SetOps
@@ -354,10 +354,12 @@ tcGetClsDefaults mods = do
   module_env_defaults <- eps_defaults <$> getEps
   liftIO $ mapMaybeM (lookupClsDefault hug module_env_defaults) mods
 
-lookupClsDefault :: HomeUnitGraph -> ModuleEnv DefaultEnv -> Module -> IO (Maybe DefaultEnv)
+lookupClsDefault :: HasCallStack => HomeUnitGraph -> ModuleEnv DefaultEnv -> Module -> IO (Maybe DefaultEnv)
 lookupClsDefault hug module_env_defaults mod =
   lookupHugByModule mod hug >>= \case
-             Just hm -> pure $ Just $ md_defaults $ hm_details hm
+             Just hm -> do
+              df <- get_md_defaults $ hm_details hm
+              pure $ Just df
              Nothing -> pure $ lookupModuleEnv module_env_defaults mod
 
 tcGetInstEnvs :: TcM InstEnvs

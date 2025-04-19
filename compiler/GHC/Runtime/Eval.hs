@@ -868,7 +868,7 @@ getContext = withSession $ \HscEnv{ hsc_IC=ic } ->
 
 -- | Returns @True@ if the specified module is interpreted, and hence has
 -- its full top-level scope available.
-moduleIsInterpreted :: GhcMonad m => Module -> m Bool
+moduleIsInterpreted :: HasCallStack => GhcMonad m => Module -> m Bool
 moduleIsInterpreted modl = withSession $ \h ->
  if notHomeModule (hsc_home_unit h) modl
         then return False

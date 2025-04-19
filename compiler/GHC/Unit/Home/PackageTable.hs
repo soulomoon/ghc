@@ -197,7 +197,7 @@ addListToHpt hpt = mapM_ (uncurry (addToHpt hpt))
 -- | Get all 'CompleteMatches' (arising from COMPLETE pragmas) present in all
 -- modules from this unit's HPT.
 hptCompleteSigs :: HomePackageTable -> IO CompleteMatches
-hptCompleteSigs = concatHpt (md_complete_matches . hm_details)
+hptCompleteSigs hpt = concatHpt (md_complete_matches . hm_details) hpt
 
 -- | Find all the instance declarations (of classes and families) from this Home Package Table
 hptAllInstances :: HomePackageTable -> IO (InstEnv, [FamInst])

@@ -317,7 +317,8 @@ lookupType hsc_env name = do
    let pte = eps_PTE eps
    lookupTypeInPTE hsc_env pte name
 
-lookupTypeInPTE :: HscEnv -> PackageTypeEnv -> Name -> IO (Maybe TyThing)
+
+lookupTypeInPTE :: HasCallStack => HscEnv -> PackageTypeEnv -> Name -> IO (Maybe TyThing)
 lookupTypeInPTE hsc_env pte name = ty
   where
     hpt = hsc_HUG hsc_env
@@ -330,13 +331,16 @@ lookupTypeInPTE hsc_env pte name = ty
             -- in one-shot, we don't use the HPT
             then return $! lookupNameEnv pte name
             else HUG.lookupHugByModule mod hpt >>= \case
-             Just hm -> pure $! lookupNameEnv (md_types (hm_details hm)) name
+             Just hm -> do
+              ts <- get_md_types (hm_details hm)
+              pure $! lookupNameEnv ts name
              Nothing -> pure $! lookupNameEnv pte name
 
 -- | Find the 'ModIface' for a 'Module', searching in both the loaded home
 -- and external package module information
 lookupIfaceByModule
-        :: HomeUnitGraph
+        :: HasCallStack =>
+        HomeUnitGraph
         -> PackageIfaceTable
         -> Module
         -> IO (Maybe ModIface)

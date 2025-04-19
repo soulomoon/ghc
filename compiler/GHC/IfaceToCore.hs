@@ -144,6 +144,8 @@ import GHC.Iface.Errors.Types
 import Language.Haskell.Syntax.BooleanFormula (BooleanFormula)
 import Language.Haskell.Syntax.BooleanFormula qualified as BF(BooleanFormula(..))
 import Language.Haskell.Syntax.Extension (NoExtField (NoExtField))
+import Debug.Trace
+import GHC.Driver.Ppr (showSDocUnsafe)
 
 {-
 This module takes
@@ -586,7 +588,7 @@ typecheckIfaceForInstantiate nsubst iface
 ************************************************************************
 -}
 
-tcHiBootIface :: HscSource -> Module -> TcRn SelfBootInfo
+tcHiBootIface :: HasCallStack => HscSource -> Module -> TcRn SelfBootInfo
 -- Load the hi-boot iface for the module being compiled,
 -- if it indeed exists in the transitive closure of imports
 -- Return the ModDetails; Nothing if no hi-boot iface
@@ -609,7 +611,8 @@ tcHiBootIface hsc_src mod
                 -- And that's fine, because if M's ModInfo is in the HPT, then
                 -- it's been compiled once, and we don't need to check the boot iface
           then do { (_, hug) <- getEpsAndHug
-                  ; liftIO $
+                  ; liftIO $ do
+                    -- traceM $ "tcHiBootIface " ++ showSDocUnsafe  (ppr mod)
                     HUG.lookupHugByModule mod hug >>= pure . \case
                       Just info | mi_boot (hm_iface info) == IsBoot
                                 -> SelfBoot { sb_mds = hm_details info }

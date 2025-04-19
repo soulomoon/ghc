@@ -123,6 +123,8 @@ import Data.List.NonEmpty (NonEmpty(..))
 import Data.Time        ( getCurrentTime )
 import GHC.Iface.Recomp
 import GHC.Types.Unique.DSet
+import Control.Concurrent (myThreadId)
+import Debug.Trace
 
 -- Simpler type synonym for actions in the pipeline monad
 type P m = TPipelineClass TPhase m
@@ -229,6 +231,8 @@ compileOne' mHscMessage
             hsc_env0 summary mod_index nmods mb_old_iface mb_old_linkable
  = do
 
+   tid <- liftIO myThreadId
+   traceM $ show tid ++ " compileOne'"
    debugTraceMsg logger 2 (text "compile: input file" <+> text input_fnpp)
 
    unless (gopt Opt_KeepHiFiles lcl_dflags) $
@@ -239,13 +243,20 @@ compileOne' mHscMessage
                  [ml_obj_file $ ms_location summary]
 
    -- Initialise plugins here for any plugins enabled locally for a module.
+
+   traceM $ show tid ++ " initializePlugins"
    plugin_hsc_env <- initializePlugins hsc_env
+   traceM $ show tid ++ " mkPipeEnv"
    let pipe_env = mkPipeEnv NoStop input_fn Nothing pipelineOutput
+   traceM $ show tid ++ " hscRecompStatus"
    status <- hscRecompStatus mHscMessage plugin_hsc_env upd_summary
                 mb_old_iface mb_old_linkable (mod_index, nmods)
+   traceM $ show tid ++ " hscPipeline"
    let pipeline = hscPipeline pipe_env (setDumpPrefix pipe_env plugin_hsc_env, upd_summary, status)
+   traceM $ show tid ++ " runPipeline"
    (iface, linkable) <- runPipeline (hsc_hooks plugin_hsc_env) pipeline
    -- See Note [ModDetails and --make mode]
+   traceM $ show tid ++ " initModDetails"
    details <- initModDetails plugin_hsc_env iface
    linkable' <- traverse (initWholeCoreBindings plugin_hsc_env iface details) (homeMod_bytecode linkable)
    return $! HomeModInfo iface details (linkable { homeMod_bytecode = linkable' })
@@ -769,8 +780,12 @@ hscPipeline pipe_env (hsc_env_with_plugins, mod_sum, hsc_recomp_status) = do
   case hsc_recomp_status of
     HscUpToDate iface mb_linkable -> return (iface, mb_linkable)
     HscRecompNeeded mb_old_hash -> do
+      tid <- liftIO myThreadId
+      traceM $ show tid ++ " hscRecompNeeded"
       (tc_result, warnings) <- use (T_Hsc hsc_env_with_plugins mod_sum)
+      traceM $ show tid ++ " use (T_Hsc ..)"
       hscBackendAction <- use (T_HscPostTc hsc_env_with_plugins mod_sum tc_result warnings mb_old_hash )
+      traceM $ show tid ++ " use (T_HscPostTc .."
       hscBackendPipeline pipe_env hsc_env_with_plugins mod_sum hscBackendAction
 
 hscBackendPipeline :: P m => PipeEnv -> HscEnv -> ModSummary -> HscBackendAction -> m (ModIface, HomeModLinkable)

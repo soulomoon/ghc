@@ -42,6 +42,7 @@ import Control.Monad.Trans.Reader
 import GHC.Driver.Pipeline.LogQueue
 import Control.Concurrent.STM
 import Control.Monad.Trans.Maybe
+import Debug.Trace (traceM)
 
 -- Executing the pipelines
 
@@ -211,22 +212,28 @@ withLocalTmpFSMake env k =
 runAllPipelines :: WorkerLimit -> MakeEnv -> [MakeAction] -> IO ()
 runAllPipelines worker_limit env acts = do
   let single_worker = isWorkerLimitSequential worker_limit
-      spawn_actions :: IO [ThreadId]
-      spawn_actions = if single_worker
-        then (:[]) <$> (forkIOWithUnmask $ \unmask -> void $ runLoop (\io -> io unmask) env acts)
-        else runLoop forkIOWithUnmask env acts
+      spawn_actions :: IO [(String, ThreadId)]
+      spawn_actions = do
+        tids <- if single_worker
+          then (:[]) <$> (forkIOWithUnmask $ \unmask -> void $ runLoop (\io -> io unmask) env acts)
+          else runLoop forkIOWithUnmask env acts
+        return $ zip (identMakeAction <$> acts) tids
 
-      kill_actions :: [ThreadId] -> IO ()
-      kill_actions tids = mapM_ killThread tids
 
-  MC.bracket spawn_actions kill_actions $ \_ -> do
+      identMakeAction :: MakeAction -> String
+      identMakeAction (MakeAction name _ _) = name
+      kill_actions :: [(String, ThreadId)] -> IO ()
+      kill_actions tids = mapM_ killThread $ map snd tids
+
+  MC.bracket spawn_actions kill_actions $ \ids -> do
+    traceM ("Waiting for all actions to finish" ++ show ids)
     mapM_ waitMakeAction acts
 
 -- | Execute each action in order, limiting the amount of parallelism by the given
 -- semaphore.
 runLoop :: (((forall a. IO a -> IO a) -> IO ()) -> IO a) -> MakeEnv -> [MakeAction] -> IO [a]
 runLoop _ _env [] = return []
-runLoop fork_thread env (MakeAction act res_var :acts) = do
+runLoop fork_thread env (MakeAction _ act res_var :acts) = do
 
   -- withLocalTmpFs has to occur outside of fork to remain deterministic
   new_thread <- withLocalTmpFSMake env $ \lcl_env ->
@@ -242,7 +249,7 @@ runLoop fork_thread env (MakeAction act res_var :acts) = do
 
 type RunMakeM a = ReaderT MakeEnv (MaybeT IO) a
 
-data MakeAction = forall a . MakeAction !(RunMakeM a) !(MVar (Maybe a))
+data MakeAction = forall a . MakeAction String !(RunMakeM a) !(MVar (Maybe a))
 
 waitMakeAction :: MakeAction -> IO ()
-waitMakeAction (MakeAction _ mvar) = () <$ readMVar mvar
+waitMakeAction (MakeAction _ _ mvar) = () <$ readMVar mvar

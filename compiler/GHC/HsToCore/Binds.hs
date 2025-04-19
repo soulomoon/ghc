@@ -193,13 +193,17 @@ dsHsBind :: DynFlags
 
 dsHsBind dflags (VarBind { var_id = var
                          , var_rhs = expr })
-  = do  { core_expr <- dsLExpr expr
+  = do  {
+        traceT "dsHsBind1"
+        ; core_expr <- dsLExpr expr
                 -- Dictionary bindings are always VarBinds,
                 -- so we only need do this here
+        ; traceT "dsHsBind2"
         ; let core_bind@(id,_) = makeCorePair dflags var False 0 core_expr
               force_var = if xopt LangExt.Strict dflags
                           then [id]
                           else []
+        ; traceT "dsHsBind3"
         ; return (force_var, [core_bind]) }
 
 dsHsBind dflags b@(FunBind { fun_id = L loc fun

@@ -10,6 +10,7 @@ module GHC.Unit.Home.ModInfo
    , justBytecode
    , justObjects
    , bytecodeAndObjects
+   , get_hm_details
    )
 where
 
@@ -22,7 +23,19 @@ import GHC.Linker.Types ( Linkable(..), linkableIsNativeCodeOnly )
 
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
+import Control.Exception (SomeException)
+import GHC.Stack (HasCallStack)
 
+
+get_hm_details :: HasCallStack => HomeModInfo -> IO ModDetails
+get_hm_details hm = tryAndPanic (return (hm_details hm))
+
+tryAndPanic :: forall a. IO a -> IO a
+tryAndPanic action = do
+  !result <- try action :: IO (Either SomeException a)
+  case result of
+    Left ex  -> pprPanic "tryAndPanic" (text "Exception: " <+> text (show ex))
+    Right res  -> return res
 
 -- | Information about modules in the package being compiled
 data HomeModInfo = HomeModInfo

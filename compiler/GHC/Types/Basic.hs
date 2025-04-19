@@ -1406,7 +1406,7 @@ instance Outputable (DefMethSpec ty) where
 ************************************************************************
 -}
 
-data SuccessFlag = Succeeded | Failed
+data SuccessFlag = Succeeded | Failed deriving (Eq, Ord)
 
 instance Semigroup SuccessFlag where
   Failed <> _ = Failed

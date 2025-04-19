@@ -122,6 +122,7 @@ import GHC.Unit.Finder.Types
 import GHC.Unit.Finder (findObjectLinkableMaybe, findHomeModule)
 import GHC.Driver.Config.Finder (initFinderOpts)
 import qualified GHC.Unit.Home.Graph as HUG
+import GHC.Stack (HasCallStack)
 
 data LinkerStats = LinkerStats
   { bytesPerModule     :: !(Map Module Word64) -- ^ number of bytes linked per module
@@ -426,7 +427,7 @@ incrementLinkPlan base new = (diff,total)
 
 
 computeLinkDependencies
-  :: StgToJSConfig
+  :: HasCallStack => StgToJSConfig
   -> UnitEnv
   -> LinkSpec
   -> FinderOpts

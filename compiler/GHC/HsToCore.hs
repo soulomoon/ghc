@@ -146,14 +146,16 @@ deSugar hsc_env
              logger = hsc_logger hsc_env
              ptc = initPromotionTickContext (hsc_dflags hsc_env)
              name_ppr_ctx = mkNamePprCtx ptc (hsc_unit_env hsc_env) rdr_env
+
         ; withTiming logger
                      (text "Desugar"<+>brackets (ppr mod))
                      (const ()) $
      do { -- Desugar the program
+        traceT $ "hscDesugar1"
         ; let export_set = availsToNameSet exports
               bcknd      = backend dflags
               -- See Note [Named default declarations] in GHC.Tc.Gen.Default
-
+        ; traceT $ "hscDesugar2"
         ; (binds_cvr, m_tickInfo)
                          <- if not (isHsBootOrSig hsc_src)
                               then addTicksToBinds
@@ -162,6 +164,7 @@ deSugar hsc_env
                                        mod mod_loc
                                        export_set (typeEnvTyCons type_env) binds
                               else return (binds, Nothing)
+        ; traceT $ "hscDesugar3"
         ; modBreaks <- for
            [ (i, s)
            | i <- hsc_interp hsc_env
@@ -170,6 +173,7 @@ deSugar hsc_env
            ]
            $ \(interp, specs) -> mkModBreaks interp mod specs
 
+        ; traceT $ "hscDesugar4"
         ; ds_hpc_info <- case m_tickInfo of
             Just (orig_file2, ticks)
               | gopt Opt_Hpc $ hsc_dflags hsc_env
@@ -180,27 +184,36 @@ deSugar hsc_env
               pure $ HpcInfo (fromIntegral $ sizeSS ticks) hashNo
             _ -> pure $ emptyHpcInfo
 
+        ; traceT $ "hscDesugar5"
         ; (msgs, mb_res) <- initDs hsc_env tcg_env $
                        do { dsEvBinds ev_binds $ \ ds_ev_binds -> do
                           { core_prs <- dsTopLHsBinds binds_cvr
+                          ; traceT $ "hscDesugar5.1"
                           ; core_prs <- patchMagicDefns core_prs
+                          ; traceT $ "hscDesugar5.2"
                           ; (spec_prs, spec_rules) <- dsImpSpecs imp_specs
+                          ; traceT $ "hscDesugar5.3"
                           ; (ds_fords, foreign_prs) <- dsForeigns fords
+                          ; traceT $ "hscDesugar5.4"
                           ; ds_rules <- mapMaybeM dsRule rules
+                          ; traceT $ "hscDesugar5.5"
                           ; let hpc_init
                                   | gopt Opt_Hpc dflags = hpcInitCode (targetPlatform $ hsc_dflags hsc_env) mod ds_hpc_info
                                   | otherwise = mempty
+                          ; traceT $ "hscDesugar5.6"
                           ; return ( ds_ev_binds
                                    , foreign_prs `appOL` core_prs `appOL` spec_prs
                                    , spec_rules ++ ds_rules
                                    , ds_fords `appendStubC` hpc_init) } }
 
+        ; traceT $ "hscDesugar6"
         ; case mb_res of {
            Nothing -> return (msgs, Nothing) ;
            Just (ds_ev_binds, all_prs, all_rules, ds_fords) ->
 
      do {       -- Add export flags to bindings
           keep_alive <- readIORef keep_var
+        ; traceT $ "hscDesugar7"
         ; let (rules_for_locals, rules_for_imps) = partition isLocalRule all_rules
               final_prs = addExportFlagsAndRules bcknd export_set keep_alive
                                                  rules_for_locals (fromOL all_prs)
@@ -212,17 +225,20 @@ deSugar hsc_env
         -- You might think it doesn't matter, but the simplifier brings all top-level
         -- things into the in-scope set before simplifying; so we get no unfolding for F#!
 
+        ; traceT $ "hscDesugar8"
         ; endPassHscEnvIO hsc_env name_ppr_ctx CoreDesugar final_pgm rules_for_imps
         ; let simpl_opts = initSimpleOpts dflags
         ; let (ds_binds, ds_rules_for_imps, occ_anald_binds)
                 = simpleOptPgm simpl_opts mod final_pgm rules_for_imps
                          -- The simpleOptPgm gets rid of type
                          -- bindings plus any stupid dead code
+        ; traceT $ "hscDesugar9"
         ; putDumpFileMaybe logger Opt_D_dump_occur_anal "Occurrence analysis"
             FormatCore (pprCoreBindings occ_anald_binds $$ pprRules ds_rules_for_imps )
 
         ; endPassHscEnvIO hsc_env name_ppr_ctx CoreDesugarOpt ds_binds ds_rules_for_imps
 
+        ; traceT $ "hscDesugar10"
         ; let pluginModules = map lpModule (loadedPlugins (hsc_plugins hsc_env))
               home_unit = hsc_home_unit hsc_env
         ; let deps = mkDependencies home_unit
@@ -232,6 +248,7 @@ deSugar hsc_env
 
         ; safe_mode <- finalSafeMode dflags tcg_env
 
+        ; traceT $ "hscDesugar11"
         ; usages <- mkRecompUsageInfo hsc_env tcg_env
 
         -- id_mod /= mod when we are processing an hsig, but hsigs
@@ -243,6 +260,7 @@ deSugar hsc_env
         ; foreign_files <- readIORef th_foreign_files_var
 
         ; docs <- extractDocs dflags tcg_env
+        ; traceT $ "hscDesugar12"
 
         ; let mod_guts = ModGuts {
                 mg_module       = mod,

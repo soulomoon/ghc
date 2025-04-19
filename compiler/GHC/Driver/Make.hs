@@ -135,6 +135,8 @@ import qualified GHC.Data.Maybe as M
 import GHC.Data.Graph.Directed.Reachability
 import qualified GHC.Unit.Home.Graph as HUG
 import GHC.Unit.Home.PackageTable
+import Debug.Trace (traceM)
+import Control.Concurrent (myThreadId)
 
 -- -----------------------------------------------------------------------------
 -- Loading the program
@@ -697,6 +699,9 @@ load' mhmi_cache how_much diag_wrapper mHscMessage mod_graph = do
     liftIO $ debugTraceMsg logger 2 (hang (text "Ready for upsweep")
                                     2 (ppr build_plan))
 
+    -- Dump build_plan to a file for inspection
+    liftIO $ writeFile "build_plan.txt" (showSDocUnsafe (ppr build_plan))
+
     worker_limit <- liftIO $ mkWorkerLimit dflags
 
     (upsweep_ok, new_deps) <- withDeferredDiagnostics $ do
@@ -996,7 +1001,7 @@ interpretBuildPlan :: HomeUnitGraph
                    -> [BuildPlan]
                    -> IO ( Maybe [ModuleGraphNode] -- Is there an unresolved cycle
                          , [MakeAction] -- Actions we need to run in order to build everything
-                         , IO [Maybe (Maybe HomeModInfo)]) -- An action to query to get all the built modules at the end.
+                         , IO [(NodeKey, Maybe (Maybe HomeModInfo))]) -- An action to query to get all the built modules at the end.
 interpretBuildPlan hug mhmi_cache old_hpt plan = do
   ((mcycle, plans), build_map) <- runStateT (buildLoop plan) (BuildLoopState M.empty 1)
   let wait = collect_results (buildDep build_map)
@@ -1004,9 +1009,11 @@ interpretBuildPlan hug mhmi_cache old_hpt plan = do
 
   where
     collect_results build_map =
-      sequence (map (\br -> collect_result (resultVar br)) (M.elems build_map))
+      sequence (map (\(key,br) -> collect_result key (resultVar br)) (M.toList build_map))
       where
-        collect_result res_var = runMaybeT (waitResult res_var)
+        collect_result key res_var = do
+          r <- runMaybeT (waitResult res_var)
+          return (key, r)
 
     -- Just used for an assertion
     count_mods :: BuildPlan -> Int
@@ -1055,7 +1062,7 @@ interpretBuildPlan hug mhmi_cache old_hpt plan = do
           -- which would retain all the result variables, preventing us from collecting them
           -- after they are no longer used.
           !build_deps = getDependencies direct_deps build_map
-      !build_action <-
+      !build_action <- do
             case mod of
               InstantiationNode uid iu -> do
                 mod_idx <- nodeId
@@ -1069,6 +1076,9 @@ interpretBuildPlan hug mhmi_cache old_hpt plan = do
                 mod_idx <- nodeId
                 return $ withCurrentUnit (mgNodeUnitId mod) $ do
                      !_ <- wait_deps build_deps
+                     tid <- liftIO myThreadId
+                    --  show rehydrate_mods
+                     traceM $ show tid ++ " buildSingleModule: " ++ showSDocUnsafe (ppr mod)
                      hmi <- executeCompileNode mod_idx n_mods old_hmi hug rehydrate_mods ms
                      -- Write the HMI to an external cache (if one exists)
                      -- See Note [Caching HomeModInfo]
@@ -1088,15 +1098,16 @@ interpretBuildPlan hug mhmi_cache old_hpt plan = do
       res_var <- liftIO newEmptyMVar
       let result_var = mkResultVar res_var
       setModulePipeline (mkNodeKey mod) (mkBuildResult origin result_var)
-      return $! (MakeAction build_action res_var)
+      return $! (MakeAction ("buildSingleModule: " ++ (showSDocUnsafe $ ppr (mkNodeKey mod))) build_action res_var)
 
 
     buildOneLoopyModule :: ModuleGraphNodeWithBootFile -> BuildM [MakeAction]
     buildOneLoopyModule (ModuleGraphNodeWithBootFile mn deps) = do
       ma <- buildSingleModule (Just deps) (Loop Initialise) mn
       -- Rehydration (1) from Note [Hydrating Modules], "Loops with multiple boot files"
-      rehydrate_action <- rehydrateAction Rehydrated ((GWIB (mkNodeKey mn) IsBoot) : (map (\d -> GWIB d NotBoot) deps))
-      return $ [ma, rehydrate_action]
+      -- rehydrate_action <- rehydrateAction Rehydrated ((GWIB (mkNodeKey mn) IsBoot) : (map (\d -> GWIB d NotBoot) deps))
+      -- return $ [ma, rehydrate_action]
+      return $ [ma]
 
 
     buildModuleLoop :: [Either ModuleGraphNode ModuleGraphNodeWithBootFile] -> BuildM [MakeAction]
@@ -1107,13 +1118,15 @@ interpretBuildPlan hug mhmi_cache old_hpt plan = do
       let loop_mods = map extract ms
       -- Rehydration (2) from Note [Hydrating Modules], "Loops with multiple boot files"
       -- Fixes the space leak described in that note.
-      rehydrate_action <- rehydrateAction Finalised loop_mods
+      -- rehydrate_action <- rehydrateAction Finalised loop_mods
 
-      return $ build_modules ++ [rehydrate_action]
+      -- return $ build_modules ++ [rehydrate_action]
+      return $ build_modules ++ []
 
     -- An action which rehydrates the given keys
     rehydrateAction :: ResultLoopOrigin -> [GenWithIsBoot NodeKey] -> BuildM MakeAction
     rehydrateAction origin deps = do
+      traceM "rehydrateAction"
       !build_map <- getBuildMap
       res_var <- liftIO newEmptyMVar
       let loop_unit :: UnitId
@@ -1152,7 +1165,7 @@ interpretBuildPlan hug mhmi_cache old_hpt plan = do
       let deps_i = zip deps [0..]
       mapM update_module_pipeline deps_i
 
-      return $ MakeAction loop_action res_var
+      return $ MakeAction "rehydrateAction" loop_action res_var
 
       -- Checks that the interfaces returned from hydration match-up with the names of the
       -- modules which were fed into the function.
@@ -1179,8 +1192,10 @@ upsweep n_jobs hsc_env hmi_cache diag_wrapper mHscMessage old_hpt build_plan = d
     (cycle, pipelines, collect_result) <- interpretBuildPlan (hsc_HUG hsc_env) hmi_cache old_hpt build_plan
     runPipelines n_jobs hsc_env diag_wrapper mHscMessage pipelines
     res <- collect_result
+    let mods = snd <$> res
+    let showResult = (fmap . fmap . fmap . fmap) (const ()) res
 
-    let completed = [m | Just (Just m) <- res]
+    let completed = [m | Just (Just m) <- mods]
 
     -- Handle any cycle in the original compilation graph and return the result
     -- of the upsweep.
@@ -1188,7 +1203,9 @@ upsweep n_jobs hsc_env hmi_cache diag_wrapper mHscMessage old_hpt build_plan = d
         Just mss -> do
           throwOneError $ cyclicModuleErr mss
         Nothing  -> do
-          let success_flag = successIf (all isJust res)
+          let success_flag = successIf (all isJust mods)
+          -- when not succ, we write the failure result to a file
+          when (success_flag == Failed) $ writeFile "upsweep.result.txt" (showSDocUnsafe $ ppr showResult)
           return (success_flag, completed)
 
 toCache :: [HomeModInfo] -> M.Map (ModNodeKeyWithUid) HomeModInfo
@@ -1219,6 +1236,8 @@ upsweep_mod :: HscEnv
             -> Int  -- total number of modules
             -> IO HomeModInfo
 upsweep_mod hsc_env mHscMessage old_hmi summary mod_index nmods =  do
+  tid <- liftIO myThreadId
+  traceM $ show tid ++ " upsweep_mod"
   hmi <- compileOne' mHscMessage hsc_env summary
           mod_index nmods (hm_iface <$> old_hmi) (maybe emptyHomeModInfoLinkable hm_linkable old_hmi)
 
@@ -1649,10 +1668,10 @@ executeCompileNode k n !old_hmi hug mrehydrate_mods mni = do
   me@MakeEnv{..} <- ask
   -- Rehydrate any dependencies if this module had a boot file or is a signature file.
   lift $ MaybeT (withAbstractSem compile_sem $ withLoggerHsc k me $ \hsc_env -> do
-     hsc_env' <- liftIO $ maybeRehydrateBefore (setHUG hug hsc_env) mni fixed_mrehydrate_mods
+    --  hsc_env' <- liftIO $ maybeRehydrateBefore (setHUG hug hsc_env) mni fixed_mrehydrate_mods
      case mni of
-       ModuleNodeCompile mod -> executeCompileNodeWithSource hsc_env' me  mod
-       ModuleNodeFixed key loc -> executeCompileNodeFixed hsc_env' me key loc
+       ModuleNodeCompile mod -> executeCompileNodeWithSource hsc_env me mod
+       ModuleNodeFixed key loc -> executeCompileNodeFixed hsc_env me key loc
     )
 
   where
@@ -1728,6 +1747,7 @@ maybeRehydrateBefore hsc_env _ Nothing = return hsc_env
 maybeRehydrateBefore hsc_env mni (Just mns) = do
   knot_var <- initialise_knot_var hsc_env
   let hsc_env' = hsc_env { hsc_type_env_vars = knotVarsFromModuleEnv knot_var }
+  -- todo we might be dying here
   hmis <- mapM (fmap expectJust . lookupHpt (hsc_HPT hsc_env')) mns
   hmis' <- rehydrate hsc_env' hmis
   mapM_ (\hmi -> HUG.addHomeModInfoToHug hmi (hsc_HUG hsc_env')) hmis'

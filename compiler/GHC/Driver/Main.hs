@@ -292,7 +292,7 @@ import GHC.Types.TypeEnv
 import {-# SOURCE #-} GHC.Driver.Pipeline
 import Data.Time
 
-import System.IO.Unsafe ( unsafeInterleaveIO )
+import System.IO.Unsafe ( unsafeInterleaveIO, unsafePerformIO )
 import GHC.Iface.Env ( trace_if )
 import GHC.Platform.Ways
 import GHC.Stg.EnforceEpt.TagSig (seqTagSig)
@@ -303,6 +303,8 @@ import GHC.Cmm.Config (CmmConfig)
 import Data.Bifunctor
 import qualified GHC.Unit.Home.Graph as HUG
 import GHC.Unit.Home.PackageTable
+import Debug.Trace
+import Control.Concurrent (myThreadId)
 
 {- **********************************************************************
 %*                                                                      *
@@ -684,21 +686,30 @@ hsc_typecheck keep_rn mod_summary mb_rdr_module = do
         real_loc = realSrcLocSpan $ mkRealSrcLoc (mkFastString src_filename) 1 1
         keep_rn' = gopt Opt_WriteHie dflags || keep_rn
     massert (isHomeModule home_unit outer_mod)
+    traceT $ "hsc_typecheck1"
     tc_result <- if hsc_src == HsigFile && not (isHoleModule inner_mod)
         then ioMsgMaybe $ hoistTcRnMessage $ tcRnInstantiateSignature hsc_env outer_mod' real_loc
         else
          do hpm <- case mb_rdr_module of
                     Just hpm -> return hpm
                     Nothing -> hscParse' mod_summary
+            traceT $ "hsc_typecheck1.1"
             tc_result0 <- tcRnModule' mod_summary keep_rn' hpm
+            traceT $ "hsc_typecheck1.2"
             if hsc_src == HsigFile
-                then do (iface, _) <- liftIO $ hscSimpleIface hsc_env Nothing tc_result0 mod_summary
+                then do
+
+                        traceT $ "hsc_typecheck1.3"
+                        (iface, _) <- liftIO $ hscSimpleIface hsc_env Nothing tc_result0 mod_summary
+                        traceT $ "hsc_typecheck1.4"
                         ioMsgMaybe $ hoistTcRnMessage $
                             tcRnMergeSignatures hsc_env hpm tc_result0 iface
                 else return tc_result0
+    traceT $ "hsc_typecheck2"
     -- TODO are we extracting anything when we merely instantiate a signature?
     -- If not, try to move this into the "else" case above.
     rn_info <- extract_renamed_stuff mod_summary tc_result
+    traceT $ "hsc_typecheck3"
     return (tc_result, rn_info)
 
 -- wrapper around tcRnModule to handle safe haskell extras
@@ -983,7 +994,7 @@ add_iface_to_hpt iface details =
 
 -- Knot tying!  See Note [Knot-tying typecheckIface]
 -- See Note [ModDetails and --make mode]
-initModDetails :: HscEnv -> ModIface -> IO ModDetails
+initModDetails :: HasCallStack => HscEnv -> ModIface -> IO ModDetails
 initModDetails hsc_env iface = do
     -- NB: This result is actually not that useful
     -- in one-shot mode, since we're not going to do
@@ -996,12 +1007,16 @@ initModDetails hsc_env iface = do
     -- Later the dummy is replaced with the real ModDetails.
     -- This is to ensure any access to the ModDetails for current
     -- module in `genModDetails` will be lazy. see #25903
-    add_iface_to_hpt iface
-      (pprPanic "initModDetails: premature access to ModDetail: "
+    tid <- show <$> myThreadId
+    traceM $ (showSDocUnsafe $ text tid <> text " building " <> ppr (mi_module iface))
+    !_ <- add_iface_to_hpt iface
+      (trace (showSDocUnsafe $ text (unsafePerformIO (show <$> myThreadId))  <> text " error looking " <> ppr (mi_module iface))
+        $ pprPanic "initModDetails: premature access to ModDetail: "
                 (ppr $ mi_module iface))
       hsc_env
     details <- genModDetails hsc_env iface
-    add_iface_to_hpt iface details hsc_env
+    !_ <- add_iface_to_hpt iface details hsc_env
+    traceM $ (showSDocUnsafe $ text tid <> text " done building " <> ppr (mi_module iface))
     return details
 
 
@@ -1253,6 +1268,7 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
   -- We usually desugar even when we are not generating code, otherwise we
   -- would miss errors thrown by the desugaring (see #10600). The only
   -- exception is when it is not a HsSrcFile module.
+  traceT "hscDesugarAndSimplify1"
   mb_desugar <- if
     | hsc_src /= HsSrcFile       -> pure Nothing
     -- Desugar an empty ghc-prim:GHC.Prim module by filtering out all its
@@ -1264,28 +1280,35 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
     | ms_mod summary == gHC_PRIM -> Just <$> hscDesugar' (ms_location summary) (tc_result { tcg_binds = [] })
     | otherwise                  -> Just <$> hscDesugar' (ms_location summary) tc_result
 
+  traceT "hscDesugarAndSimplify2"
   -- Report the warnings from both typechecking and desugar together
   w <- getDiagnostics
   liftIO $ printOrThrowDiagnostics logger print_config diag_opts (unionMessages tc_warnings w)
   clearDiagnostics
+  traceT "hscDesugarAndSimplify3"
 
   -- Simplify, if appropriate, and (whether we simplified or not) generate an
   -- interface file.
   case mb_desugar of
       -- Just cause we desugared doesn't mean we are generating code, see above.
       Just desugared_guts | backendGeneratesCode bcknd -> do
+
+          traceT "hscDesugarAndSimplify4"
           plugins <- liftIO $ readIORef (tcg_th_coreplugins tc_result)
           simplified_guts <- hscSimplify' plugins desugared_guts
+          traceT "hscDesugarAndSimplify5"
 
           (cg_guts, details) <-
               liftIO $ hscTidy hsc_env simplified_guts
 
+          traceT "hscDesugarAndSimplify6"
           !partial_iface <- liftIO $
                 {-# SCC "GHC.Driver.Main.mkPartialIface" #-}
                 -- This `force` saves 2M residency in test T10370
                 -- See Note [Avoiding space leaks in toIface*] for details.
                 fmap force (mkPartialIface hsc_env (cg_binds cg_guts) details summary (tcg_import_decls tc_result) simplified_guts)
 
+          traceT "hscDesugarAndSimplify7"
           return HscRecomp { hscs_guts = cg_guts,
                              hscs_mod_location = ms_location summary,
                              hscs_partial_iface = partial_iface,
@@ -1297,17 +1320,23 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
           -- Running the simplifier once is necessary before doing byte code generation
           -- in order to inline data con wrappers but we honour whatever level of simplificication the
           -- user requested. See #22008 for some discussion.
+          traceT "hscDesugarAndSimplify8"
           plugins <- liftIO $ readIORef (tcg_th_coreplugins tc_result)
+          traceT "hscDesugarAndSimplify9"
           simplified_guts <- hscSimplify' plugins desugared_guts
+          traceT "hscDesugarAndSimplify10"
           (cg_guts, _) <-
               liftIO $ hscTidy hsc_env simplified_guts
 
+          traceT "hscDesugarAndSimplify11"
           (iface, _details) <- liftIO $
             hscSimpleIface hsc_env (Just $ cg_binds cg_guts) tc_result summary
 
+          traceT "hscDesugarAndSimplify12"
           liftIO $ hscMaybeWriteIface logger dflags True iface mb_old_hash (ms_location summary)
 
           -- when compiling gHC_PRIM without generating code (e.g. with
+          traceT "hscDesugarAndSimplify13"
           -- Haddock), we still want the virtual interface in the cache
           if ms_mod summary == gHC_PRIM
             then return $ HscUpdate (getGhcPrimIface hsc_env)
@@ -1317,11 +1346,14 @@ hscDesugarAndSimplify summary (FrontendTypecheck tc_result) tc_warnings mb_old_h
       -- We are not generating code or writing an interface with simplified core so we can skip simplification
       -- and generate a simple interface.
       _ -> do
+        traceT "hscDesugarAndSimplify14"
         (iface, _details) <- liftIO $
           hscSimpleIface hsc_env Nothing tc_result summary
 
+        traceT "hscDesugarAndSimplify15"
         liftIO $ hscMaybeWriteIface logger dflags True iface mb_old_hash (ms_location summary)
 
+        traceT "hscDesugarAndSimplify16"
         -- when compiling gHC_PRIM without generating code (e.g. with
         -- Haddock), we still want the virtual interface in the cache
         if ms_mod summary == gHC_PRIM
@@ -1482,7 +1514,9 @@ genModDetails hsc_env old_iface
                   initIfaceLoadModule hsc_env (mi_module old_iface) (typecheckIface old_iface)
     case lookupKnotVars (hsc_type_env_vars hsc_env) (mi_module old_iface) of
       Nothing -> return ()
-      Just te_var -> writeIORef te_var (md_types new_details)
+      Just te_var -> do
+        dt <- get_md_types new_details
+        writeIORef te_var dt
     dumpIfaceStats hsc_env
     return new_details
 

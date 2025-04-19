@@ -94,7 +94,7 @@ getLinkDeps opts interp pls span mods = do
       get_link_deps opts pls maybe_normal_osuf span mods
 
 get_link_deps
-  :: LinkDepsOpts
+  :: HasCallStack => LinkDepsOpts
   -> LoaderState
   -> Maybe FilePath  -- replace object suffixes?
   -> SrcSpan

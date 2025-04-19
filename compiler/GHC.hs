@@ -459,6 +459,7 @@ import System.Exit      ( exitWith, ExitCode(..) )
 import System.FilePath
 import System.IO.Error  ( isDoesNotExistError )
 import GHC.Unit.Home.PackageTable
+import Debug.Trace (traceM)
 
 -- %************************************************************************
 -- %*                                                                      *
@@ -1506,15 +1507,17 @@ availsToGlobalRdrEnv hsc_env mod avails
                          is_qual = False, is_isboot = NotBoot, is_pkg_qual = NoPkgQual,
                          is_dloc = srcLocSpan interactiveSrcLoc }
 
-getHomeModuleInfo :: HscEnv -> Module -> IO (Maybe ModuleInfo)
-getHomeModuleInfo hsc_env mdl =
+getHomeModuleInfo :: HasCallStack => HscEnv -> Module -> IO (Maybe ModuleInfo)
+getHomeModuleInfo hsc_env mdl = do
+  -- traceM $ "getHomeModuleInfo " ++ showSDoc (hsc_dflags hsc_env) (ppr mdl)
   HUG.lookupHugByModule mdl (hsc_HUG hsc_env) >>= \case
     Nothing  -> return Nothing
     Just hmi -> do
       let details  = hm_details hmi
           iface    = hm_iface hmi
+      types <- get_md_types details
       return (Just (ModuleInfo {
-                        minf_type_env  = md_types details,
+                        minf_type_env  = types,
                         minf_exports   = md_exports details,
                          -- NB: already forced. See Note [Forcing GREInfo] in GHC.Types.GREInfo.
                         minf_instances = instEnvElts $ md_insts details,

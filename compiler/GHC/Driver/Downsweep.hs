@@ -664,7 +664,7 @@ rootSummariesParallel n_jobs hsc_env diag_wrapper msg get_summary = do
 
     action_and_result (log_queue_id, ts) = do
       res_var <- liftIO newEmptyMVar
-      pure $! (MakeAction (action log_queue_id ts) res_var, readMVar res_var)
+      pure $! (MakeAction "rootSummariesParallel" (action log_queue_id ts) res_var, readMVar res_var)
 
     action log_queue_id target_bundle = do
       env@MakeEnv {compile_sem} <- ask

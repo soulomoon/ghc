@@ -1,6 +1,8 @@
 module GHC.Unit.Module.ModDetails
    ( ModDetails (..)
    , emptyModDetails
+   , get_md_types
+   , get_md_defaults
    )
 where
 
@@ -13,6 +15,26 @@ import GHC.Types.CompleteMatch
 import GHC.Types.DefaultEnv
 import GHC.Types.TypeEnv
 import GHC.Types.Annotations ( Annotation )
+import GHC.Stack (HasCallStack)
+import System.IO (IO)
+import Data.Either (Either(..))
+import Control.Exception (SomeException, try)
+import GHC.Utils.Panic (pprPanic)
+import GHC.Utils.Outputable (text, IsLine ((<+>)))
+import GHC.Prelude (Show(..), Monad (return))
+
+get_md_types :: HasCallStack => ModDetails -> IO TypeEnv
+get_md_types md = tryAndPanic (return (md_types md))
+
+get_md_defaults :: HasCallStack => ModDetails -> IO DefaultEnv
+get_md_defaults md = tryAndPanic (return (md_defaults md))
+
+tryAndPanic :: forall a. IO a -> IO a
+tryAndPanic action = do
+  result <- try action :: IO (Either SomeException a)
+  case result of
+    Left ex  -> pprPanic "tryAndPanic" (text "Exception: " <+> text (show ex))
+    Right res  -> return res
 
 -- | The 'ModDetails' is essentially a cache for information in the 'ModIface'
 -- for home modules only. Information relating to packages will be loaded into
