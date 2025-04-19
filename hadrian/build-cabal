@@ -2,7 +2,8 @@
 
 CABAL="${CABAL:-cabal}"
 GHC="${GHC:-ghc}"
-CABFLAGS=("--with-compiler=$GHC" "--disable-documentation" "--disable-profiling" "--disable-library-profiling" $CABFLAGS)
+CABFLAGS=("--with-compiler=$GHC" "--disable-documentation" "--disable-profiling" "--disable-library-profiling" "--allow-newer" $CABFLAGS)
+# CABFLAGS=("--with-compiler=$GHC" "--disable-documentation" "--disable-profiling" "--disable-library-profiling" $CABFLAGS)
 ( $GHC --info | grep -s '("Support SMP","YES")' > /dev/null ) || CABFLAGS+=("--constraint=hadrian -threaded")
 
 # It is currently more robust to pass Cabal an absolute path to the project file.
