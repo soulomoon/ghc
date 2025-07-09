@@ -115,7 +115,7 @@ import GHC.Unit.External
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Encoding
-import GHC.Utils.Misc ( HasDebugCallStack )
+import GHC.Utils.Misc ( HasDebugCallStack, HasCallStack )
 
 import GHC.Data.FastString
 import GHC.Data.List.SetOps
