@@ -121,6 +121,7 @@ import GHC.Iface.Errors.Types
 import Data.Function ((&))
 import GHC.Unit.Module.Graph
 import qualified GHC.Unit.Home.Graph as HUG
+import GHC.Stack (HasCallStack)
 
 {-
 ************************************************************************
@@ -148,7 +149,7 @@ where the code that e1 expands to might import some defns that
 also turn out to be needed by the code that e2 expands to.
 -}
 
-tcLookupImported_maybe :: Name -> TcM (MaybeErr IfaceMessage TyThing)
+tcLookupImported_maybe ::HasCallStack => Name -> TcM (MaybeErr IfaceMessage TyThing)
 -- Returns (Failed err) if we can't find the interface file for the thing
 tcLookupImported_maybe name
   = do  { hsc_env <- getTopEnv
@@ -189,7 +190,7 @@ importDecl name
         ; case lookupTypeEnv (eps_PTE eps) name of
             Just thing -> return $ Succeeded thing
             Nothing    -> return $ Failed $
-              Can'tFindNameInInterface name
+              Can'tFindNameInInterface "importDecl" name
               (filter is_interesting $ nonDetNameEnvElts $ eps_PTE eps)
     }}}
   where

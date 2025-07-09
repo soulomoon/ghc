@@ -2025,7 +2025,7 @@ tcIfaceOneShot IfaceOneShot = OneShotLam
 ************************************************************************
 -}
 
-tcIfaceGlobal :: Name -> IfL TyThing
+tcIfaceGlobal :: HasCallStack => Name -> IfL TyThing
 tcIfaceGlobal name
   | Just thing <- wiredInNameTyThing_maybe name
         -- Wired-in things include TyCons, DataCons, and Ids

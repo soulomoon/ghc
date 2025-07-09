@@ -146,6 +146,7 @@ import Control.Monad
 import Data.IORef
 import Data.List          ( intercalate )
 import qualified Data.List.NonEmpty as NE
+import GHC.Exception (CallStack)
 
 {- *********************************************************************
 *                                                                      *
@@ -197,7 +198,7 @@ lookupImported_maybe hsc_env name
             Nothing    -> importDecl_maybe hsc_env name
         }
 
-importDecl_maybe :: HscEnv -> Name -> IO (MaybeErr IfaceMessage TyThing)
+importDecl_maybe :: HasCallStack => HscEnv -> Name -> IO (MaybeErr IfaceMessage TyThing)
 importDecl_maybe hsc_env name
   | Just thing <- wiredInNameTyThing_maybe name
   = do  { when (needWiredInHomeIface thing)

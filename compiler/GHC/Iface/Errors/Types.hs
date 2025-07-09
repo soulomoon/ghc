@@ -50,6 +50,7 @@ data IfaceMessage
       MissingInterfaceError
       InterfaceLookingFor
   | Can'tFindNameInInterface
+      String    -- function name that uses it
       Name
       [TyThing] -- possibly relevant TyThings
   | CircularImport !Module

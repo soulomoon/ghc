@@ -288,8 +288,8 @@ cantFindErrorX pkg_hidden_hint may_show_locations mod_or_interface (CantFindInst
 
 interfaceErrorDiagnostic :: IfaceMessageOpts -> IfaceMessage -> SDoc
 interfaceErrorDiagnostic opts = \ case
-  Can'tFindNameInInterface name relevant_tyThings ->
-    missingDeclInInterface name relevant_tyThings
+  Can'tFindNameInInterface function_name name relevant_tyThings ->
+    missingDeclInInterface function_name name relevant_tyThings
   Can'tFindInterface err looking_for ->
     hangNotEmpty (lookingForHerald looking_for) 2 (missingInterfaceErrorDiagnostic opts err)
   CircularImport mod ->
@@ -365,11 +365,12 @@ homeModError mod location
     <+> text "which is not loaded"
 
 
-missingDeclInInterface :: Name -> [TyThing] -> SDoc
-missingDeclInInterface name things =
+missingDeclInInterface :: String -> Name -> [TyThing] -> SDoc
+missingDeclInInterface function_name name things =
   whenPprDebug (found_things $$ empty) $$
   hang (text "Can't find interface-file declaration for" <+>
-         pprNameSpace (nameNameSpace name) <+> ppr name)
+         pprNameSpace (nameNameSpace name) <+> ppr name <+>
+         text "(used in" <+> text function_name <> text ")")
     2 (vcat [text "Probable cause: bug in .hi-boot file, or inconsistent .hi file",
              text "Use -ddump-if-trace to get an idea of which file caused the error"])
   where

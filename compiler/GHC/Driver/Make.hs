@@ -52,7 +52,7 @@ import GHC.Prelude
 import GHC.Platform
 
 import GHC.Tc.Utils.Backpack
-import GHC.Tc.Utils.Monad  ( initIfaceCheck, concatMapM )
+import GHC.Tc.Utils.Monad  ( initIfaceCheck )
 
 import GHC.Runtime.Interpreter
 import qualified GHC.Linker.Loader as Linker
@@ -1012,7 +1012,7 @@ interpretBuildPlan :: HomeUnitGraph
                          , IO [Maybe (Maybe HomeModInfo)]) -- An action to query to get all the built modules at the end.
 interpretBuildPlan hug mhmi_cache old_hpt plan = do
   ((mcycle, plans), build_map) <- runStateT (buildLoop plan) (BuildLoopState M.empty 1)
-  -- pprTraceM "interpretBuildPlan" (vcat [text "Build plan:" <+> ppr plan])
+  pprTraceM "interpretBuildPlan" (vcat [text "Build plan:" <+> ppr plan])
   let wait = collect_results (buildDep build_map)
   return (mcycle, plans, wait)
 
@@ -1124,10 +1124,10 @@ interpretBuildPlan hug mhmi_cache old_hpt plan = do
 
     buildModuleLoop :: [Either ModuleGraphNode ModuleGraphNodeWithBootFile] -> BuildM [MakeAction]
     buildModuleLoop ms = do
-      build_modules <- concatMapM (either (fmap pure . buildSingleModule (Loop Initialise)) (\(ModuleGraphNodeWithBootFile mn _) -> buildOneModule mn)) ms
-      let extract (Left mn) = GWIB (mkNodeKey mn) NotBoot
-          extract (Right (ModuleGraphNodeWithBootFile mn _)) = GWIB (mkNodeKey mn) IsBoot
-      let loop_mods = map extract ms
+      build_modules <- mapM (either (buildSingleModule (Loop Initialise)) (\(ModuleGraphNodeWithBootFile mn _) -> buildSingleModule (Loop Initialise) mn)) ms
+      let extract (Left mn) = GWIB (mkNodeKey mn) . isBootModuleNodeInfo <$> mgNodeIsModule mn
+          extract (Right (ModuleGraphNodeWithBootFile mn _)) = GWIB (mkNodeKey mn) . isBootModuleNodeInfo <$> mgNodeIsModule mn
+      let loop_mods = mapMaybe extract ms
       -- Rehydration (2) from Note [Hydrating Modules], "Loops with multiple boot files"
       -- Fixes the space leak described in that note.
       rehydrate_action <- rehydrateAction Finalised loop_mods
@@ -1137,6 +1137,7 @@ interpretBuildPlan hug mhmi_cache old_hpt plan = do
     rehydrateAction' origin node =
       let isBoot = maybe NotBoot isBootModuleNodeInfo (mgNodeIsModule node)  -- Non-module nodes are not boot interfaces
       in rehydrateAction origin [GWIB (mkNodeKey node) isBoot]
+
     -- An action which rehydrates the given keys
     rehydrateAction :: ResultLoopOrigin -> [GenWithIsBoot NodeKey] -> BuildM MakeAction
     rehydrateAction origin deps = do
@@ -1169,15 +1170,18 @@ interpretBuildPlan hug mhmi_cache old_hpt plan = do
       return $ MakeAction loop_action res_var
 
     -- boot_key :: NodeKey -> NodeKey -> Origin
-    boot_key (NodeKey_Module m) = NodeKey_Module (m { mnkModuleName = (mnkModuleName m) { gwib_isBoot = IsBoot } } )
-    boot_key k = pprPanic "boot_key" (ppr k)
+    -- boot_key (NodeKey_Module m) = NodeKey_Module (m { mnkModuleName = (mnkModuleName m) { gwib_isBoot = IsBoot } } )
+    -- boot_key k = pprPanic "boot_key" (ppr k)
+    none_boot_key (NodeKey_Module m) = NodeKey_Module (m { mnkModuleName = (mnkModuleName m) { gwib_isBoot = NotBoot } } )
+    none_boot_key k = pprPanic "boot_key" (ppr k)
     update_module_pipeline origin fanout (m, i) =
       case gwib_isBoot m of
-        NotBoot -> setModulePipeline (gwib_mod m) (mkBuildResult (Loop origin) (fanout i))
         IsBoot -> do
           setModulePipeline (gwib_mod m) (mkBuildResult (Loop origin) (fanout i))
           -- SPECIAL: Anything outside the loop needs to see A rather than A.hs-boot
-          setModulePipeline (boot_key (gwib_mod m)) (mkBuildResult (Loop origin) (fanout i))
+          setModulePipeline (none_boot_key (gwib_mod m)) (mkBuildResult (Loop origin) (fanout i))
+        NotBoot -> do
+          setModulePipeline (gwib_mod m) (mkBuildResult (Loop origin) (fanout i))
 
       -- Checks that the interfaces returned from hydration match-up with the names of the
       -- modules which were fed into the function.
