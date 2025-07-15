@@ -47,6 +47,7 @@ module GHC.Unit.Home.PackageTable
   , hptCollectDependencies
   , hptCollectObjects
   , hptCollectModules
+  , hptCollect
 
     -- ** Memory dangerous queries
   , concatHpt
@@ -71,6 +72,7 @@ module GHC.Unit.Home.PackageTable
     -- | This API is deprecated and meant to be removed.
   , addToHpt
   , addListToHpt
+  , lookupHptByModuleWithBoot
   ) where
 
 import GHC.Prelude
@@ -98,7 +100,7 @@ import qualified GHC.Data.Word64Set as W64
 -- | Helps us find information about modules in the home package
 newtype HomePackageTable = HPT {
 
-    table :: IORef (DModuleNameEnv HomeModInfo)
+    table :: IORef (DModuleNameEnv HomeModeInfoWithBoot)
     -- ^ Domain = modules in this home unit
     --
     -- This is an IORef because we want to avoid leaking HPTs (see the particularly bad #25511).
@@ -128,10 +130,32 @@ emptyHomePackageTable = do
 --------------------------------------------------------------------------------
 -- * Lookups in the HPT
 --------------------------------------------------------------------------------
+toHomeModeInfo :: IsBootInterface -> HomeModeInfoWithBoot -> HomeModInfo
+toHomeModeInfo _ (HomeModeInfoWithoutBoot modInfo) = modInfo
+toHomeModeInfo _ (HomeModeInfoWithBoot modInfo Nothing) = modInfo
+toHomeModeInfo IsBoot (HomeModeInfoWithBoot modInfo _) = modInfo
+toHomeModeInfo NotBoot (HomeModeInfoWithBoot _ (Just nonBootModInfo)) = nonBootModInfo
+
+buildHomeModeInfo :: HomeModeInfoWithBoot -> HomeModInfo
+buildHomeModeInfo = toHomeModeInfo NotBoot
 
 -- | Lookup the 'HomeModInfo' of a module in the HPT, given its name.
 lookupHpt :: HomePackageTable -> ModuleName -> IO (Maybe HomeModInfo)
-lookupHpt HPT{table=hpt} mn = (`lookupUDFM` mn) <$!> readIORef hpt
+lookupHpt hpt mn =  lookupHptWithBoot hpt mn NotBoot
+
+-- | Lookup the 'HomeModInfo' of a module in the HPT, given its name.
+lookupHptWithBoot :: HomePackageTable -> ModuleName -> IsBootInterface -> IO (Maybe HomeModInfo)
+lookupHptWithBoot HPT{table=hpt} mn isBoot = do
+  (fmap (toHomeModeInfo isBoot). (`lookupUDFM` mn)) <$!> readIORef hpt
+
+
+lookupHptByModuleWithBoot :: HomePackageTable -> Module -> IsBootInterface -> IO (Maybe HomeModInfo)
+lookupHptByModuleWithBoot hpt mod isBoot
+  = -- The HPT is indexed by ModuleName, not Module,
+    -- we must check for a hit on the right Module
+    lookupHptWithBoot hpt (moduleName mod) isBoot >>= pure . \case
+      Just hm | mi_module (hm_iface hm) == mod -> Just hm
+      _otherwise                               -> Nothing
 
 -- | Lookup the 'HomeModInfo' of a 'Module' in the HPT.
 lookupHptByModule :: HomePackageTable -> Module -> IO (Maybe HomeModInfo)
@@ -162,13 +186,13 @@ addHomeModInfoToHpt hmi hpt = addToHpt hpt (moduleName (mi_module (hm_iface hmi)
 -- After deprecation cycle, move `addToHpt` to a `where` clause inside `addHomeModInfoToHpt`.
 addToHpt :: HomePackageTable -> ModuleName -> HomeModInfo -> IO ()
 addToHpt HPT{table=hptr} mn hmi = do
-  atomicModifyIORef' hptr (\hpt -> (addToUDFM hpt mn hmi, ()))
+  atomicModifyIORef' hptr (\hpt -> (alterUDFM (Just . updateHomeModInfoWithBoot hmi) hpt mn , ()))
   -- If the key already existed in the map, this insertion is overwriting
   -- the HMI of a previously loaded module (likely in rehydration).
 
 -- | 'addHomeModInfoToHpt' for multiple module infos.
 addHomeModInfosToHpt :: HomePackageTable -> [HomeModInfo] -> IO ()
-addHomeModInfosToHpt hpt = mapM_ (flip addHomeModInfoToHpt hpt)
+addHomeModInfosToHpt hpt = mapM_ (`addHomeModInfoToHpt` hpt)
 
 -- | Thin each HPT variable to only contain keys from the given dependencies.
 -- This is used at the end of upsweep to make sure that only completely successfully loaded
@@ -215,6 +239,12 @@ hptAllAnnotations = fmap mkAnnEnv . concatHpt (md_anns . hm_details)
 --------------------------------------------------------------------------------
 -- * Traversal-based queries
 --------------------------------------------------------------------------------
+-- | Collects all 'HomeModInfo's in the HPT, applying the function @f@ to each
+hptCollect :: Monoid b => (HomeModInfo -> b -> b) -> HomePackageTable -> IO b
+hptCollect f HPT{table} = do
+  hpt <- readIORef table
+  return $
+    foldUDFM (f . buildHomeModeInfo) mempty hpt
 
 -- | Collect the immediate dependencies of all modules in the HPT into a Set.
 -- The immediate dependencies are given by the iface as @'dep_direct_pkgs' . 'mi_deps'@.
@@ -224,29 +254,20 @@ hptAllAnnotations = fmap mkAnnEnv . concatHpt (md_anns . hm_details)
 -- currently takes all dependencies only to then filter them with an ad-hoc transitive closure check.
 -- See #25639
 hptCollectDependencies :: HomePackageTable -> IO (Set.Set (IfaceImportLevel, UnitId))
-hptCollectDependencies HPT{table} = do
-  hpt <- readIORef table
-  return $
-    foldr (Set.union . dep_direct_pkgs . mi_deps . hm_iface) Set.empty hpt
+hptCollectDependencies = hptCollect (Set.union . dep_direct_pkgs . mi_deps . hm_iface)
 
 -- | Collect the linkable object of all modules in the HPT.
 -- The linkable objects are given by @'homeModInfoObject'@.
 --
 -- $O(n)$ in the number of modules in the HPT.
 hptCollectObjects :: HomePackageTable -> IO [Linkable]
-hptCollectObjects HPT{table} = do
-  hpt <- readIORef table
-  return $
-    foldr ((:) . expectJust . homeModInfoObject) [] hpt
+hptCollectObjects = hptCollect ((:) . expectJust . homeModInfoObject)
 
 -- | Collect all module ifaces in the HPT
 --
 -- $O(n)$ in the number of modules in the HPT.
 hptCollectModules :: HomePackageTable -> IO [Module]
-hptCollectModules HPT{table} = do
-  hpt <- readIORef table
-  return $
-    foldr ((:) . mi_module . hm_iface) [] hpt
+hptCollectModules = hptCollect ((:) . mi_module . hm_iface)
 
 --------------------------------------------------------------------------------
 -- * Utilities
@@ -265,7 +286,7 @@ pprHPT HPT{table=hptr} = do
   hpt <- readIORef hptr
   return $!
     pprUDFM hpt $ \hms ->
-      vcat [ ppr (mi_module (hm_iface hm))
+      vcat [ ppr (mi_module (hm_iface $ buildHomeModeInfo hm))
            | hm <- hms ]
 
 ----------------------------------------------------------------------------------
@@ -304,7 +325,7 @@ concatHpt f HPT{table} = do
   hpt <- readIORef table
   return $ concat . eltsUDFM . mapMaybeUDFM g $ hpt
   where
-    g hmi = case f hmi of { [] -> Nothing; as -> Just as }
+    g hmi = case f (buildHomeModeInfo hmi) of { [] -> Nothing; as -> Just as }
 
 --------------------------------------------------------------------------------
 -- * Internals (see haddocks!)
@@ -312,12 +333,12 @@ concatHpt f HPT{table} = do
 
 -- | Gets the internal 'IORef' which holds the 'HomeModInfo's of this HPT.
 -- Use with care.
-hptInternalTableRef :: HomePackageTable -> IORef (DModuleNameEnv HomeModInfo)
+hptInternalTableRef :: HomePackageTable -> IORef (DModuleNameEnv HomeModeInfoWithBoot)
 hptInternalTableRef = table
 
 -- | Construct a HomePackageTable from the IORef.
 -- Use with care, only if you can really justify going around the intended insert-only API.
-hptInternalTableFromRef :: IORef (DModuleNameEnv HomeModInfo) -> IO HomePackageTable
+hptInternalTableFromRef :: IORef (DModuleNameEnv HomeModeInfoWithBoot) -> IO HomePackageTable
 hptInternalTableFromRef ref = do
   return HPT {
     table = ref

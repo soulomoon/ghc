@@ -39,6 +39,7 @@ module GHC.Driver.Env
 
     -- * Legacy API
    , hscUpdateHPT
+   , lookupIfaceByModuleWithBoot
    )
 where
 
@@ -349,6 +350,17 @@ lookupTypeInPTE hsc_env pte name = ty
             else HUG.lookupHugByModule mod hpt >>= \case
              Just hm -> pure $! lookupNameEnv (md_types (hm_details hm)) name
              Nothing -> pure $! lookupNameEnv pte name
+
+lookupIfaceByModuleWithBoot
+        :: HomeUnitGraph
+        -> PackageIfaceTable
+        -> Module
+        -> IsBootInterface
+        -> IO (Maybe ModIface)
+lookupIfaceByModuleWithBoot hug pit mod isBoot
+  = HUG.lookupHugByModuleWithBoot mod hug isBoot >>= pure . \case
+       Just hm -> Just (hm_iface hm)
+       Nothing -> lookupModuleEnv pit mod
 
 -- | Find the 'ModIface' for a 'Module', searching in both the loaded home
 -- and external package module information

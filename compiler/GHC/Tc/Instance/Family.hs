@@ -286,14 +286,14 @@ why we still do redundant checks.
 -- We don't need to check the current module, this is done in
 -- tcExtendLocalFamInstEnv.
 -- See Note [The type family instance consistency story].
-checkFamInstConsistency :: ModuleEnv FamInstEnv -> [Module] -> TcM ()
+checkFamInstConsistency :: ModuleEnv FamInstEnv -> [ModuleWithIsBoot] -> TcM ()
 checkFamInstConsistency hpt_fam_insts directlyImpMods
   = do { (eps, hug) <- getEpsAndHug
        ; traceTc "checkFamInstConsistency" (ppr directlyImpMods)
        ; let { -- Fetch the iface of a given module.  Must succeed as
                -- all directly imported modules must already have been loaded.
                modIface mod = liftIO $
-                 lookupIfaceByModule hug (eps_PIT eps) mod >>= \case
+                 lookupIfaceByModuleWithBoot hug (eps_PIT eps) (gwib_mod mod) (gwib_isBoot mod) >>= \case
                    Nothing    -> panicDoc "FamInst.checkFamInstConsistency"
                                           (ppr mod $$ ppr (HUG.allUnits hug))
                    Just iface -> pure iface
@@ -303,13 +303,13 @@ checkFamInstConsistency hpt_fam_insts directlyImpMods
                -- Itself (if a family instance module) and its dep_finsts.
                -- This is df(D_i) from
                -- Note [Checking family instance optimization]
-             ; modConsistent :: Module -> TcM [Module]
-             ; modConsistent mod = do
-                 ifc <- modIface mod
-                 deps <- dep_finsts . mi_deps <$> modIface mod
+             ; modConsistent :: ModuleWithIsBoot -> TcM [Module]
+             ; modConsistent modWithIsboot = do
+                 ifc <- modIface modWithIsboot
+                 deps <- dep_finsts . mi_deps <$> modIface modWithIsboot
                  pure $
                    if mi_finsts ifc
-                      then mod:deps
+                      then gwib_mod modWithIsboot:deps
                       else deps
 
 
@@ -327,15 +327,15 @@ checkFamInstConsistency hpt_fam_insts directlyImpMods
     -- See Note [Checking family instance optimization]
     checkMany
       :: ModuleEnv FamInstEnv     -- home package family instances
-      -> (Module -> TcM [Module]) -- given A, modules checked when A was checked
-      -> [Module]                 -- modules to process
+      -> (ModuleWithIsBoot -> TcM [Module]) -- given A, modules checked when A was checked
+      -> [ModuleWithIsBoot]                 -- modules to process
       -> TcM ()
     checkMany hpt_fam_insts modConsistent mods = go [] emptyModuleSet mods
       where
       go :: [Module] -- list of consistent modules
          -> ModuleSet -- set of consistent modules, same elements as the
                       -- list above
-         -> [Module] -- modules to process
+         -> [ModuleWithIsBoot] -- modules to process
          -> TcM ()
       go _ _ [] = return ()
       go consistent consistent_set (mod:mods) = do

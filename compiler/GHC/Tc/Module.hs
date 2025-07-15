@@ -537,9 +537,20 @@ tcRnImports hsc_env import_decls
         ; let { dir_imp_mods = M.keys
                              . imp_mods
                              $ imports }
+
+        -- attach the boot information found in direct_import_isBoot to direct_imports
+        ; let attachBootInfo :: [Module] -> InstalledModuleEnv (S.Set ImportLevel, ModuleNameWithIsBoot) -> [ModuleWithIsBoot]
+              attachBootInfo direct_imports direct_import_isBoot =
+                map (\m -> fromMaybe (GWIB m NotBoot) $ attachBootToModule m) direct_imports
+                where
+                  attachBootToModule :: Module -> Maybe ModuleWithIsBoot
+                  attachBootToModule mod = do
+                    (_, mnwib) <- lookupInstalledModuleEnv direct_import_isBoot (toUnitId <$> mod)
+                    return $ GWIB mod (gwib_isBoot mnwib)
+        ; let dir_imp_mods_with_boots = attachBootInfo dir_imp_mods (imp_direct_dep_mods imports)
         ; logger <- getLogger
         ; withTiming logger (text "ConsistencyCheck"<+>brackets (ppr this_mod)) (const ())
-            $ checkFamInstConsistency hpt_fam_insts dir_imp_mods
+            $ checkFamInstConsistency hpt_fam_insts dir_imp_mods_with_boots
         ; traceRn "rn1: } checking family instance consistency" empty
 
         ; gbl_env <- getGblEnv

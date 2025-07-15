@@ -66,6 +66,7 @@ module GHC.Unit.Home.Graph
   , unitEnv_lookup
   , unitEnv_traverseWithKey
   , unitEnv_assocs
+  , lookupHugByModuleWithBoot
   ) where
 
 import GHC.Prelude
@@ -171,7 +172,6 @@ mkHomeUnitEnv us dbs dflags hpt home_unit = HomeUnitEnv
 --------------------------------------------------------------------------------
 -- * Operations on HUG
 --------------------------------------------------------------------------------
-
 -- | Add an entry to the 'HomePackageTable' under the unit of that entry.
 addHomeModInfoToHug :: HomeModInfo -> HomeUnitGraph -> IO ()
 addHomeModInfoToHug hmi hug =
@@ -256,6 +256,13 @@ lookupHugByModule mod hug =
   case lookupHugUnit (moduleUnit mod) hug of
     Nothing -> pure Nothing
     Just env -> lookupHptByModule (homeUnitEnv_hpt env) mod
+
+-- | Lookup the 'HomeModInfo' of a 'Module' in the 'HomeUnitGraph' (via the 'HomePackageTable' of the corresponding unit)
+lookupHugByModuleWithBoot :: Module -> HomeUnitGraph -> IsBootInterface -> IO (Maybe HomeModInfo)
+lookupHugByModuleWithBoot mod hug isBoot =
+  case lookupHugUnit (moduleUnit mod) hug of
+    Nothing -> pure Nothing
+    Just env -> lookupHptByModuleWithBoot (homeUnitEnv_hpt env) mod isBoot
 
 -- | Lookup all 'HomeModInfo' that have the same 'ModuleName' as the given 'ModuleName'.
 -- 'ModuleName's are not unique in the case of multiple home units, so there can be

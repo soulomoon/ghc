@@ -37,7 +37,7 @@ module GHC.Iface.Load (
 
         getGhcPrimIface,
 
-        module Iface_Errors -- avoids boot files in Ppr modules
+        module Iface_Errors, whereFromIsBootInterface -- avoids boot files in Ppr modules
    ) where
 
 import GHC.Prelude
@@ -445,7 +445,7 @@ loadInterface doc_str mod from
                 -- Check whether we have the interface already
         ; hsc_env <- getTopEnv
         ; let mhome_unit = ue_homeUnit (hsc_unit_env hsc_env)
-        ; liftIO (lookupIfaceByModule hug (eps_PIT eps) mod) >>= \case {
+        ; liftIO (lookupIfaceByModuleWithBoot hug (eps_PIT eps) mod (whereFromIsBootInterface from)) >>= \case {
             Just iface
                 -> return (Succeeded iface) ;   -- Already loaded
             _ -> do {
@@ -1232,6 +1232,10 @@ data WhereFrom
   = ImportByUser IsBootInterface        -- Ordinary user import (perhaps {-# SOURCE #-})
   | ImportBySystem                      -- Non user import.
   | ImportByPlugin                      -- Importing a plugin.
+
+whereFromIsBootInterface :: WhereFrom -> IsBootInterface
+whereFromIsBootInterface (ImportByUser IsBoot) = IsBoot
+whereFromIsBootInterface _ = NotBoot
 
 instance Outputable WhereFrom where
   ppr (ImportByUser IsBoot)                = text "{- SOURCE -}"
