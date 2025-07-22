@@ -19,7 +19,7 @@ jobs:
       # image: soulomoon/ghc-build-env:latest
       # image: registry.gitlab.haskell.org/ghc/ci-images/aarch64-linux-deb12:latest
       image: registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb12:latest
-      options: --user root
+      # options: --user root
     env:
       # GHC_FLAGS: -Werror
       # BIGNUM_BACKEND: gmp
