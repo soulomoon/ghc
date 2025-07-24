@@ -35,6 +35,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: CheckSpace
+        shell: bash
+        run: df -h
+
       - name: Setup Cabal
         shell: bash
 
