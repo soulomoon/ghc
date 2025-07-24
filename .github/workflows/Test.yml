@@ -47,6 +47,6 @@ jobs:
         shell: bash
         run: |
           export CORES="$(mk/detect-cpu-count.sh)"
-          ./hadrian/build -j${CORES} --flavour=quickest test
+          ./hadrian/build -j${CORES} --flavour=validate test
           # . .gitlab/ci.sh build_hadrian
           # . .gitlab/ci.sh test_hadrian
