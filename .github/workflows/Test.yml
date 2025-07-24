@@ -32,6 +32,9 @@ jobs:
       run:
         shell: bash
     steps:
+      - name: CheckSpace
+        shell: bash
+        run: df -h
       - name: Checkout
         uses: actions/checkout@v4
 
