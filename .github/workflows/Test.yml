@@ -78,7 +78,7 @@ jobs:
 
 
 
-      - uses: nicknovitski/nix-develop
+      - uses: nicknovitski/nix-develop@main
         with:
             arguments: "git+https://gitlab.haskell.org/ghc/ghc.nix --accept-flake-config"
 
