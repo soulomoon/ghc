@@ -88,7 +88,7 @@ jobs:
       #     # remove-swapfile: 'true'
       #     verbose: 'true'
 
-      - name: Setup Cabal
+      - name: Run Hadrian build test
         shell: bash
 
         run: |
@@ -98,10 +98,5 @@ jobs:
           nix develop git+https://gitlab.haskell.org/ghc/ghc.nix --accept-flake-config
           . .gitlab/ci.sh setup
           . .gitlab/ci.sh configure
-
-      - name: Run Hadrian build test
-        shell: bash
-        run: |
-          export CORES="$(mk/detect-cpu-count.sh)"
           . .gitlab/ci.sh build_hadrian
           . .gitlab/ci.sh test_hadrian
