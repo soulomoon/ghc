@@ -62,7 +62,7 @@ jobs:
 
       - name: CheckSpace
         shell: bash
-        run: df -h
+        run: sudo du -h --max-depth=3 /
 
 
       - name: Maximize build space
