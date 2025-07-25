@@ -93,8 +93,9 @@ jobs:
       - name: CheckSpace
         shell: bash
         run: df -h
-      # - name: Hadrian build
-      #   run: . .gitlab/ci.sh build_hadrian
+
+      - name: Hadrian build
+        run: . .gitlab/ci.sh build_hadrian
 
       - name: Hadrian test
         run: . .gitlab/ci.sh test_hadrian
