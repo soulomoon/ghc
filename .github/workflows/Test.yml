@@ -65,7 +65,7 @@ jobs:
           hatchet-protocol: 'cleave'
           witness-carnage: true  # Default: false
       - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      # - uses: DeterminateSystems/magic-nix-cache-action@main
       # - uses: DeterminateSystems/flake-checker-action@main
       - name: Checkout
         uses: actions/checkout@v4
