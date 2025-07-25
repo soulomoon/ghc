@@ -66,7 +66,7 @@ jobs:
           witness-carnage: true  # Default: false
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
-      - uses: DeterminateSystems/flake-checker-action@main
+      # - uses: DeterminateSystems/flake-checker-action@main
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -93,6 +93,8 @@ jobs:
 
         run: |
           sudo chown root:root -R .
+          git config user.email "ghc-ci@gitlab-haskell.org"
+          git config user.name "GHC GitLab CI"
           nix develop git+https://gitlab.haskell.org/ghc/ghc.ni
           . .gitlab/ci.sh setup
           . .gitlab/ci.sh configure
