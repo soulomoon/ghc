@@ -92,7 +92,7 @@ jobs:
         shell: bash
 
         run: |
-          sudo chown root:root -R .
+          # sud chown root:root -R .
           git config user.email "ghc-ci@gitlab-haskell.org"
           git config user.name "GHC GitLab CI"
           nix develop git+https://gitlab.haskell.org/ghc/ghc.ni
