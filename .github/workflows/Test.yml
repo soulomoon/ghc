@@ -40,11 +40,11 @@ jobs:
       matrix:
         # You can add multiple configurations here if needed
         config: [default]
-    container:
-      # image: soulomoon/ghc-build-env:latest
-      # image: registry.gitlab.haskell.org/ghc/ci-images/aarch64-linux-deb12:latest
-      image: soulomoon/ci-images-x86_64-linux-deb12:latest
-      options: --user root
+    # container:
+    #   # image: soulomoon/ghc-build-env:latest
+    #   # image: registry.gitlab.haskell.org/ghc/ci-images/aarch64-linux-deb12:latest
+    #   image: soulomoon/ci-images-x86_64-linux-deb12:latest
+    #   options: --user root
     env:
       # GHC_FLAGS: -Werror
       # BIGNUM_BACKEND: gmp
@@ -57,32 +57,38 @@ jobs:
       run:
         shell: bash
     steps:
+      - uses: wimpysworld/nothing-but-nix@main
+        with:
+          hatchet-protocol: 'cleave'
+          witness-carnage: true  # Default: false
+
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: CheckSpace
-        shell: bash
-        run: sudo du -h --max-depth=3 /
+      # - name: CheckSpace
+      #   shell: bash
+      #   run: sudo du -h --max-depth=3 /
 
 
-      - name: Maximize build space
-        uses: ./.github/actions/free-up-space
-        with:
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'false'
-          remove-codeql: 'true'
-          remove-docker-images: 'false'
-          remove-large-packages: 'true'
-          remove-cached-tools: 'true'
-          # remove-swapfile: 'true'
-          verbose: 'true'
+      # - name: Maximize build space
+      #   uses: ./.github/actions/free-up-space
+      #   with:
+      #     remove-dotnet: 'true'
+      #     remove-android: 'true'
+      #     remove-haskell: 'false'
+      #     remove-codeql: 'true'
+      #     remove-docker-images: 'false'
+      #     remove-large-packages: 'true'
+      #     remove-cached-tools: 'true'
+      #     # remove-swapfile: 'true'
+      #     verbose: 'true'
 
       - name: Setup Cabal
         shell: bash
 
         run: |
           sudo chown root:root -R .
+          nix develop git+https://gitlab.haskell.org/ghc/ghc.ni
           . .gitlab/ci.sh setup
           . .gitlab/ci.sh configure
 
@@ -90,6 +96,5 @@ jobs:
         shell: bash
         run: |
           export CORES="$(mk/detect-cpu-count.sh)"
-          ./hadrian/build -j${CORES} --flavour=validate test
-          # . .gitlab/ci.sh build_hadrian
-          # . .gitlab/ci.sh test_hadrian
+          . .gitlab/ci.sh build_hadrian
+          . .gitlab/ci.sh test_hadrian
