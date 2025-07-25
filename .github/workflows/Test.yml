@@ -92,9 +92,12 @@ jobs:
       #     # remove-swapfile: 'true'
       #     verbose: 'true'
 
+
       - uses: nicknovitski/nix-develop
+          with:
+            arguments: "git+https://gitlab.haskell.org/ghc/ghc.nix --accept-flake-config"
       - name: Run Hadrian build test
-        shell: nix develop git+https://gitlab.haskell.org/ghc/ghc.nix --accept-flake-config --command bash -e {0}
+        shell: nix develop --command bash -e {0}
         run: |
 
           . .gitlab/ci.sh setup
