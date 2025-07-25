@@ -8,33 +8,33 @@ on:
 
 
 jobs:
-  pre-cleanup:
-    runs-on: ubuntu-latest
-    steps:
-      - name: CheckSpace
-        shell: bash
-        run: df -h
-      - name: Checkout
-        uses: actions/checkout@v4
+  # pre-cleanup:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: CheckSpace
+  #       shell: bash
+  #       run: df -h
+  #     - name: Checkout
+  #       uses: actions/checkout@v4
 
-      - name: Free Disk Space (Ubuntu)
-        uses: jlumbroso/free-disk-space@main
-        with:
-          # this might remove tools that are actually needed,
-          # if set to "true" but frees about 6 GB
-          tool-cache: false
-          # all of these default to true, but feel free to set to
-          # "false" if necessary for your workflow
-          android: true
-          dotnet: true
-          haskell: false
-          large-packages: true
-          docker-images: false
-          swap-storage: true
+  #     - name: Free Disk Space (Ubuntu)
+  #       uses: jlumbroso/free-disk-space@main
+  #       with:
+  #         # this might remove tools that are actually needed,
+  #         # if set to "true" but frees about 6 GB
+  #         tool-cache: false
+  #         # all of these default to true, but feel free to set to
+  #         # "false" if necessary for your workflow
+  #         android: true
+  #         dotnet: true
+  #         haskell: false
+  #         large-packages: true
+  #         docker-images: false
+  #         swap-storage: true
 
   hadrian-build-build:
     runs-on: ubuntu-latest
-    needs: [pre-cleanup]
+    # needs: [pre-cleanup]
     strategy:
       fail-fast: true
       matrix:
@@ -61,6 +61,11 @@ jobs:
       - name: CheckSpace
         shell: bash
         run: df -h
+
+      - name: Maximize build space
+        uses: AdityaGarg8/remove-unwanted-software@v5
+        with:
+          remove-android: 'true'
 
       - name: Setup Cabal
         shell: bash
