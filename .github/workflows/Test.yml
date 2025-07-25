@@ -97,7 +97,6 @@ jobs:
         with:
             arguments: "git+https://gitlab.haskell.org/ghc/ghc.nix --accept-flake-config"
       - name: Run Hadrian build test
-        shell: nix develop --command bash -e {0}
         run: |
 
           . .gitlab/ci.sh setup
