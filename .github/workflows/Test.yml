@@ -96,6 +96,7 @@ jobs:
       - uses: nicknovitski/nix-develop
         with:
             arguments: "git+https://gitlab.haskell.org/ghc/ghc.nix --accept-flake-config"
+
       - name: Run Hadrian build test
         run: |
 
