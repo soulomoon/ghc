@@ -82,12 +82,16 @@ jobs:
         with:
             arguments: "git+https://gitlab.haskell.org/ghc/ghc.nix --accept-flake-config"
 
+
       - name: Hadrian setup
         run: . .gitlab/ci.sh setup
 
       - name: Hadrian configure
         run: . .gitlab/ci.sh configure
 
+      - name: CheckSpace
+        shell: bash
+        run: df -h
       # - name: Hadrian build
       #   run: . .gitlab/ci.sh build_hadrian
 
