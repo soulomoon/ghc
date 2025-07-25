@@ -224,6 +224,13 @@ function set_toolchain_paths() {
     *) fail "bad toolchain_source"
   esac
 
+  echo "Using toolchain source: $toolchain_source"
+  echo "Toolchain paths:"
+  echo "  CABAL: ${which cabal}"
+  echo "  GHC: ${which ghc}"
+  echo "  HAPPY: ${which happy}"
+  echo "  ALEX: ${which alex}"
+
   export GHC
   export CABAL
   export HAPPY
