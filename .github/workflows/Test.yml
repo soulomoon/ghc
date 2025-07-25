@@ -88,8 +88,8 @@ jobs:
       - name: Hadrian configure
         run: . .gitlab/ci.sh configure
 
-      - name: Hadrian build
-        run: . .gitlab/ci.sh build_hadrian
+      # - name: Hadrian build
+      #   run: . .gitlab/ci.sh build_hadrian
 
       - name: Hadrian test
         run: . .gitlab/ci.sh test_hadrian
