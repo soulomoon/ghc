@@ -94,6 +94,7 @@ jobs:
         run: |
           git config user.email "ghc-ci@gitlab-haskell.org"
           git config user.name "GHC GitLab CI"
+          . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
           # cachix useghc-nix
           nix develop git+https://gitlab.haskell.org/ghc/ghc.nix --accept-flake-config
           . .gitlab/ci.sh setup
