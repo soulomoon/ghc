@@ -568,7 +568,7 @@ backpackProgressMsg level logger msg =
 mkBackpackMsg :: BkpM Messager
 mkBackpackMsg = do
     level <- getBkpLevel
-    return $ \hsc_env mod_index recomp node ->
+    return $ \hsc_env mod_index recomp (node, _) ->
       let dflags = hsc_dflags hsc_env
           logger = hsc_logger hsc_env
           state = hsc_units hsc_env

@@ -9,7 +9,8 @@ import GHC.Utils.Outputable
 import GHC.Utils.Error
 import GHC.Unit.State
 
-type Messager = HscEnv -> (Int,Int) -> RecompileRequired -> ModuleGraphNode -> IO ()
+
+type Messager = HscEnv -> (Int,Int) -> RecompileRequired -> (ModuleGraphNode, IsTypecheck) -> IO ()
 
 --------------------------------------------------------------
 -- Progress displayers.
@@ -24,10 +25,10 @@ oneShotMsg logger recomp =
 batchMsg :: Messager
 batchMsg = batchMsgWith (\_ _ _ _ -> empty)
 batchMultiMsg :: Messager
-batchMultiMsg = batchMsgWith (\_ _ _ node -> brackets (ppr (mgNodeUnitId node)))
+batchMultiMsg = batchMsgWith (\_ _ _ node -> brackets (ppr (mgNodeUnitId $ fst node)))
 
-batchMsgWith :: (HscEnv -> (Int, Int) -> RecompileRequired -> ModuleGraphNode -> SDoc) -> Messager
-batchMsgWith extra hsc_env_start mod_index recomp node =
+batchMsgWith :: (HscEnv -> (Int, Int) -> RecompileRequired -> (ModuleGraphNode, IsTypecheck) -> SDoc) -> Messager
+batchMsgWith extra hsc_env_start mod_index recomp (node, isTypecheck) =
       case recomp of
         UpToDate
           | logVerbAtLeast logger 2 -> showMsg (text "Skipping") empty
@@ -36,7 +37,7 @@ batchMsgWith extra hsc_env_start mod_index recomp node =
           MustCompile            -> empty
           (RecompBecause reason) -> text " [" <> pprWithUnitState state (ppr reason) <> text "]"
     where
-        herald = case node of
+        herald = show isTypecheck ++ " " ++ case node of
                     LinkNode {} -> "Linking"
                     InstantiationNode {} -> "Instantiating"
                     ModuleNode {} -> "Compiling"
@@ -49,7 +50,7 @@ batchMsgWith extra hsc_env_start mod_index recomp node =
             compilationProgressMsg logger $
             (showModuleIndex mod_index <>
             msg <+> showModMsg dflags (recompileRequired recomp) node)
-                <> extra hsc_env mod_index recomp node
+                <> extra hsc_env mod_index recomp (node, isTypecheck)
                 <> reason
 
 {- **********************************************************************

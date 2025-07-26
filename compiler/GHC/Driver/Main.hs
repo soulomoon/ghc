@@ -818,6 +818,7 @@ This is the only thing that isn't caught by the type-system.
 -- This function is the *only* place in the compiler where we decide whether to
 -- recompile a module or not!
 hscRecompStatus :: Maybe Messager
+                -> IsTypecheck
                 -> HscEnv
                 -> ModSummary
                 -> Maybe ModIface
@@ -825,11 +826,11 @@ hscRecompStatus :: Maybe Messager
                 -> (Int,Int)
                 -> IO HscRecompStatus
 hscRecompStatus
-    mHscMessage hsc_env mod_summary mb_old_iface old_linkable mod_index
+    mHscMessage it hsc_env mod_summary mb_old_iface old_linkable mod_index
   = do
     let
         msg what = case mHscMessage of
-          Just hscMessage -> hscMessage hsc_env mod_index what (ModuleNode [] (ModuleNodeCompile mod_summary))
+          Just hscMessage -> hscMessage hsc_env mod_index what (ModuleNode [] (ModuleNodeCompile mod_summary), it)
           Nothing -> return ()
 
     -- First check to see if the interface file agrees with the

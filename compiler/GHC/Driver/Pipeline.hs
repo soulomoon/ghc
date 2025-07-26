@@ -39,7 +39,7 @@ module GHC.Driver.Pipeline (
    llvmPipeline, llvmLlcPipeline, llvmManglePipeline, pipelineStart,
 
    -- * Default method of running a pipeline
-   runPipeline
+   runPipeline, hscTypecheckPipeline, afterTypeCheckPipeline, NeedComilePlan(..), typeCheckOne, afterTypecheckOne
 ) where
 
 
@@ -123,6 +123,11 @@ import Data.List.NonEmpty (NonEmpty(..))
 import Data.Time        ( getCurrentTime )
 import GHC.Iface.Recomp
 import GHC.Types.Unique.DSet
+import GHC.Tc.Types (FrontendResult (FrontendTypecheck), TcGblEnv)
+import GHC.Fingerprint.Type (Fingerprint)
+import GHC.Core (CoreProgram)
+import GHC.Unit.Module.ModDetails (ModDetails)
+import GHC.Unit.Module.Graph (IsTypecheck(..))
 
 -- Simpler type synonym for actions in the pipeline monad
 type P m = TPipelineClass TPhase m
@@ -241,7 +246,7 @@ compileOne' mHscMessage
    -- Initialise plugins here for any plugins enabled locally for a module.
    plugin_hsc_env <- initializePlugins hsc_env
    let pipe_env = mkPipeEnv NoStop input_fn Nothing pipelineOutput
-   status <- hscRecompStatus mHscMessage plugin_hsc_env upd_summary
+   status <- hscRecompStatus mHscMessage NotTypecheck plugin_hsc_env upd_summary
                 mb_old_iface mb_old_linkable (mod_index, nmods)
    let pipeline = hscPipeline pipe_env (setDumpPrefix pipe_env plugin_hsc_env, upd_summary, status)
    (iface, linkable) <- runPipeline (hsc_hooks plugin_hsc_env) pipeline
@@ -249,6 +254,170 @@ compileOne' mHscMessage
    details <- initModDetails plugin_hsc_env iface
    linkable' <- traverse (initWholeCoreBindings plugin_hsc_env iface details) (homeMod_bytecode linkable)
    return $! HomeModInfo iface details (linkable { homeMod_bytecode = linkable' })
+
+ where lcl_dflags  = ms_hspp_opts summary
+       location    = ms_location summary
+       input_fn    = expectJust (ml_hs_file location)
+       input_fnpp  = ms_hspp_file summary
+
+       pipelineOutput = backendPipelineOutput bcknd
+
+       logger = hsc_logger hsc_env0
+       tmpfs  = hsc_tmpfs hsc_env0
+
+       basename = dropExtension input_fn
+
+       -- We add the directory in which the .hs files resides) to the import
+       -- path.  This is needed when we try to compile the .hc file later, if it
+       -- imports a _stub.h file that we created here.
+       current_dir = takeDirectory basename
+       old_paths   = includePaths lcl_dflags
+       loadAsByteCode
+         | Just Target { targetAllowObjCode = obj } <- findTarget summary (hsc_targets hsc_env0)
+         , not obj
+         = True
+         | otherwise = False
+       -- Figure out which backend we're using
+       (bcknd, dflags3)
+         -- #8042: When module was loaded with `*` prefix in ghci, but DynFlags
+         -- suggest to generate object code (which may happen in case -fobject-code
+         -- was set), force it to generate byte-code. This is NOT transitive and
+         -- only applies to direct targets.
+         | loadAsByteCode
+         = ( interpreterBackend
+           , gopt_set (lcl_dflags { backend = interpreterBackend }) Opt_ForceRecomp
+           )
+
+         | otherwise
+         = (backend dflags, lcl_dflags)
+       -- See Note [Filepaths and Multiple Home Units]
+       dflags  = dflags3 { includePaths = offsetIncludePaths dflags3 $ addImplicitQuoteInclude old_paths [current_dir] }
+       upd_summary = summary { ms_hspp_opts = dflags }
+       hsc_env = hscSetFlags dflags hsc_env0
+
+
+hscSimpleIface :: HscEnv
+               -> Maybe CoreProgram
+               -> TcGblEnv
+               -> ModSummary
+               -> IO (ModIface, ModDetails)
+hscSimpleIface hsc_env mb_core_program tc_result summary
+    = runHsc hsc_env $ hscSimpleIface' mb_core_program tc_result summary
+
+afterTypecheckOne :: Maybe Messager
+            -> HscEnv
+            -> NeedComilePlan
+            -> ModSummary      -- ^ summary for module being compiled
+            -> Int             -- ^ module N ...
+            -> Int             -- ^ ... of M
+            -> Maybe ModIface  -- ^ old interface, if we have one
+            -> HomeModLinkable
+            -> IO HomeModInfo   -- ^ the complete HomeModInfo, if successful
+
+afterTypecheckOne mHscMessage
+            hsc_env0 needComilePlan summary mod_index nmods mb_old_iface mb_old_linkable
+ = do
+
+   debugTraceMsg logger 2 (text "compile: input file" <+> text input_fnpp)
+
+   unless (gopt Opt_KeepHiFiles lcl_dflags) $
+             addFilesToClean tmpfs TFL_CurrentModule $
+                 [ml_hi_file $ ms_location summary]
+   unless (gopt Opt_KeepOFiles lcl_dflags) $
+             addFilesToClean tmpfs TFL_GhcSession $
+                 [ml_obj_file $ ms_location summary]
+
+   -- Initialise plugins here for any plugins enabled locally for a module.
+   plugin_hsc_env <- initializePlugins hsc_env
+   let pipe_env = mkPipeEnv NoStop input_fn Nothing pipelineOutput
+   status <- hscRecompStatus mHscMessage NotTypecheck plugin_hsc_env upd_summary
+                mb_old_iface mb_old_linkable (mod_index, nmods)
+   let pipeline = afterTypeCheckPipeline pipe_env (setDumpPrefix pipe_env plugin_hsc_env, upd_summary, needComilePlan)
+   (iface, linkable) <- runPipeline (hsc_hooks plugin_hsc_env) pipeline
+   -- See Note [ModDetails and --make mode]
+   details <- initModDetails plugin_hsc_env iface
+   linkable' <- traverse (initWholeCoreBindings plugin_hsc_env iface details) (homeMod_bytecode linkable)
+   return $! HomeModInfo iface details (linkable { homeMod_bytecode = linkable' })
+
+ where lcl_dflags  = ms_hspp_opts summary
+       location    = ms_location summary
+       input_fn    = expectJust (ml_hs_file location)
+       input_fnpp  = ms_hspp_file summary
+
+       pipelineOutput = backendPipelineOutput bcknd
+
+       logger = hsc_logger hsc_env0
+       tmpfs  = hsc_tmpfs hsc_env0
+
+       basename = dropExtension input_fn
+
+       -- We add the directory in which the .hs files resides) to the import
+       -- path.  This is needed when we try to compile the .hc file later, if it
+       -- imports a _stub.h file that we created here.
+       current_dir = takeDirectory basename
+       old_paths   = includePaths lcl_dflags
+       loadAsByteCode
+         | Just Target { targetAllowObjCode = obj } <- findTarget summary (hsc_targets hsc_env0)
+         , not obj
+         = True
+         | otherwise = False
+       -- Figure out which backend we're using
+       (bcknd, dflags3)
+         -- #8042: When module was loaded with `*` prefix in ghci, but DynFlags
+         -- suggest to generate object code (which may happen in case -fobject-code
+         -- was set), force it to generate byte-code. This is NOT transitive and
+         -- only applies to direct targets.
+         | loadAsByteCode
+         = ( interpreterBackend
+           , gopt_set (lcl_dflags { backend = interpreterBackend }) Opt_ForceRecomp
+           )
+
+         | otherwise
+         = (backend dflags, lcl_dflags)
+       -- See Note [Filepaths and Multiple Home Units]
+       dflags  = dflags3 { includePaths = offsetIncludePaths dflags3 $ addImplicitQuoteInclude old_paths [current_dir] }
+       upd_summary = summary { ms_hspp_opts = dflags }
+       hsc_env = hscSetFlags dflags hsc_env0
+
+typeCheckOne :: Maybe Messager
+            -> HscEnv
+            -> ModSummary      -- ^ summary for module being compiled
+            -> Int             -- ^ module N ...
+            -> Int             -- ^ ... of M
+            -> Maybe ModIface  -- ^ old interface, if we have one
+            -> HomeModLinkable
+            -> IO (HomeModInfo, NeedComilePlan)   -- ^ the complete HomeModInfo, if successful
+
+typeCheckOne mHscMessage
+            hsc_env0 summary mod_index nmods mb_old_iface mb_old_linkable
+ = do
+
+   debugTraceMsg logger 2 (text "compile: input file" <+> text input_fnpp)
+
+   unless (gopt Opt_KeepHiFiles lcl_dflags) $
+             addFilesToClean tmpfs TFL_CurrentModule $
+                 [ml_hi_file $ ms_location summary]
+   unless (gopt Opt_KeepOFiles lcl_dflags) $
+             addFilesToClean tmpfs TFL_GhcSession $
+                 [ml_obj_file $ ms_location summary]
+
+   -- Initialise plugins here for any plugins enabled locally for a module.
+   plugin_hsc_env <- initializePlugins hsc_env
+   let pipe_env = mkPipeEnv NoStop input_fn Nothing pipelineOutput
+   status <- hscRecompStatus mHscMessage IsTypecheck plugin_hsc_env upd_summary
+                mb_old_iface mb_old_linkable (mod_index, nmods)
+   let pipeline = hscTypecheckPipeline pipe_env (setDumpPrefix pipe_env plugin_hsc_env, upd_summary, status)
+
+   needComilePlan <- runPipeline (hsc_hooks plugin_hsc_env) pipeline
+   case needComilePlan of
+      NeedCompilePlan (FrontendTypecheck tc_result) warnings mb_old_hash -> do
+        (iface, details) <- hscSimpleIface plugin_hsc_env Nothing tc_result summary
+        return $! (HomeModInfo iface details emptyHomeModInfoLinkable, needComilePlan)
+      DonNeedCompil iface linkable -> do
+          -- See Note [ModDetails and --make mode]
+          details <- initModDetails plugin_hsc_env iface
+          linkable' <- traverse (initWholeCoreBindings plugin_hsc_env iface details) (homeMod_bytecode linkable)
+          return $! (HomeModInfo iface details (linkable { homeMod_bytecode = linkable' }), needComilePlan)
 
  where lcl_dflags  = ms_hspp_opts summary
        location    = ms_location summary
@@ -774,6 +943,26 @@ hscPipeline pipe_env (hsc_env_with_plugins, mod_sum, hsc_recomp_status) = do
       (tc_result, warnings) <- use (T_Hsc hsc_env_with_plugins mod_sum)
       hscBackendAction <- use (T_HscPostTc hsc_env_with_plugins mod_sum tc_result warnings mb_old_hash )
       hscBackendPipeline pipe_env hsc_env_with_plugins mod_sum hscBackendAction
+
+afterTypeCheckPipeline :: P m => PipeEnv -> (HscEnv, ModSummary, NeedComilePlan) -> m (ModIface, HomeModLinkable)
+afterTypeCheckPipeline pipe_env (hsc_env_with_plugins, mod_sum, hsc_recomp_status) = do
+  case hsc_recomp_status of
+    DonNeedCompil iface mb_linkable -> return (iface, mb_linkable)
+    NeedCompilePlan tc_result warnings mb_old_hash -> do
+      hscBackendAction <- use (T_HscPostTc hsc_env_with_plugins mod_sum tc_result warnings mb_old_hash )
+      hscBackendPipeline pipe_env hsc_env_with_plugins mod_sum hscBackendAction
+
+data NeedComilePlan =
+  DonNeedCompil ModIface HomeModLinkable
+  | NeedCompilePlan FrontendResult (Messages GhcMessage) (Maybe Fingerprint)
+
+hscTypecheckPipeline :: P m => PipeEnv ->  (HscEnv, ModSummary, HscRecompStatus) -> m NeedComilePlan
+hscTypecheckPipeline _pipe_env (hsc_env_with_plugins, mod_sum, hsc_recomp_status) = do
+  case hsc_recomp_status of
+    HscUpToDate iface mb_linkable -> return (DonNeedCompil iface mb_linkable)
+    HscRecompNeeded old_hash -> do
+      (tc_result, warnings) <- use (T_Hsc hsc_env_with_plugins mod_sum)
+      return (NeedCompilePlan tc_result warnings old_hash)
 
 hscBackendPipeline :: P m => PipeEnv -> HscEnv -> ModSummary -> HscBackendAction -> m (ModIface, HomeModLinkable)
 hscBackendPipeline pipe_env hsc_env mod_sum result =

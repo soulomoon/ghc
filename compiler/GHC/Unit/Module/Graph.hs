@@ -18,6 +18,7 @@ module GHC.Unit.Module.Graph
     --
     -- | A module graph should be constructed once by downsweep and never modified.
      ModuleGraph(..)
+   , IsTypecheck(..)
    , emptyMG
    , mkModuleGraph
    , mkModuleGraphChecked
@@ -238,6 +239,7 @@ mkModuleGraphChecked nodes =
 -- * Module Graph Nodes
 --------------------------------------------------------------------------------
 
+data IsTypecheck = IsTypecheck | NotTypecheck deriving (Eq, Ord, Show)
 -- | A '@ModuleGraphNode@' is a node in the '@ModuleGraph@'.
 -- Edges between nodes mark dependencies arising from module imports
 -- and dependencies arising from backpack instantiations.
@@ -737,10 +739,10 @@ data NodeKey = NodeKey_Unit {-# UNPACK #-} !InstantiatedUnit
   deriving (Eq, Ord)
 
 instance Outputable NodeKey where
-  ppr (NodeKey_Unit iu)   = ppr iu
-  ppr (NodeKey_Module mk) = ppr mk
-  ppr (NodeKey_Link uid)  = ppr uid
-  ppr (NodeKey_ExternalUnit uid) = ppr uid
+  ppr (NodeKey_Unit iu)   = text "NodeKey_Unit" <+> ppr iu
+  ppr (NodeKey_Module mk) = text "NodeKey_Module" <+> ppr mk
+  ppr (NodeKey_Link uid)  = text "NodeKey_Link" <+> ppr uid
+  ppr (NodeKey_ExternalUnit uid) = text "NodeKey_ExternalUnit" <+> ppr uid
 
 mkNodeKey :: ModuleGraphNode -> NodeKey
 mkNodeKey = \case

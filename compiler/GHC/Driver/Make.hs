@@ -46,6 +46,7 @@ module GHC.Driver.Make (
         summariseFile,
 
         instantiationNodes,
+        IsTypecheck(..)
         ) where
 
 import GHC.Prelude
@@ -80,7 +81,7 @@ import GHC.Iface.Recomp    ( RecompileRequired(..), CompileReason(..) )
 
 import GHC.Data.Bag        ( listToBag )
 import GHC.Data.Graph.Directed
-import GHC.Data.Maybe      ( expectJust )
+import GHC.Data.Maybe      ( expectJust, whenIsJust )
 
 import GHC.Utils.Exception ( throwIO, SomeAsyncException )
 import GHC.Utils.Outputable
@@ -136,6 +137,8 @@ import qualified GHC.Data.Maybe as M
 import GHC.Data.Graph.Directed.Reachability
 import qualified GHC.Unit.Home.Graph as HUG
 import GHC.Unit.Home.PackageTable
+import Debug.Trace (trace)
+import GHC.Tc.Errors.Types (NotClosedReason(NotTypeClosed))
 
 -- -----------------------------------------------------------------------------
 -- Loading the program
@@ -715,7 +718,9 @@ load' mhmi_cache how_much diag_wrapper mHscMessage mod_graph = do
 
     -- At this point, all the HPT variables will be populated, but we don't want
     -- to leak the contents of a failed session.
-    liftIO $ restrictDepsHscEnv new_deps hsc_env
+    let getNonTypecheckResult (CompiledResult x) = Just x
+        getNonTypecheckResult _ = Nothing
+    liftIO $ restrictDepsHscEnv (mapMaybe getNonTypecheckResult new_deps) hsc_env
     case upsweep_ok of
       Failed -> loadFinish upsweep_ok
       Succeeded -> do
@@ -951,8 +956,14 @@ mkResultVar = ResultVar id
 waitResult :: ResultVar a -> MaybeT IO a
 waitResult (ResultVar f var) = MaybeT (fmap f <$> readMVar var)
 
+data ResultKind = TypecheckResult NeedComilePlan HomeModInfo | CompiledResult HomeModInfo
+updateResultKind :: HomeModInfo -> ResultKind -> ResultKind
+updateResultKind hmi (TypecheckResult ncp _) = TypecheckResult ncp hmi
+updateResultKind hmi (CompiledResult _) = CompiledResult hmi
+
+
 data BuildResult = BuildResult { _resultOrigin :: ResultOrigin
-                               , resultVar    :: ResultVar (Maybe HomeModInfo)
+                               , resultVar    :: ResultVar (Maybe ResultKind)
                                }
 
 -- The origin of this result var, useful for debugging
@@ -960,11 +971,11 @@ data ResultOrigin = NoLoop | Loop ResultLoopOrigin deriving (Show)
 
 data ResultLoopOrigin = Initialise | Rehydrated | Finalised deriving (Show)
 
-mkBuildResult :: ResultOrigin -> ResultVar (Maybe HomeModInfo) -> BuildResult
+mkBuildResult :: ResultOrigin -> ResultVar (Maybe ResultKind) -> BuildResult
 mkBuildResult = BuildResult
 
 
-data BuildLoopState = BuildLoopState { buildDep :: M.Map NodeKey BuildResult
+data BuildLoopState = BuildLoopState { buildDep :: M.Map NodeKeyWithIsTypeCheck BuildResult
                                           -- The current way to build a specific TNodeKey, without cycles this just points to
                                           -- the appropriate result of compiling a module  but with
                                           -- cycles there can be additional indirection and can point to the result of typechecking a loop
@@ -978,37 +989,73 @@ nodeId = do
   return n
 
 
-setModulePipeline :: NodeKey -> BuildResult -> BuildM ()
+setModulePipeline :: NodeKeyWithIsTypeCheck -> BuildResult -> BuildM ()
 setModulePipeline mgn build_result = do
   modify (\m -> m { buildDep = M.insert mgn build_result (buildDep m) })
 
-type BuildMap = M.Map NodeKey BuildResult
+type BuildMap = M.Map NodeKeyWithIsTypeCheck BuildResult
 
 getBuildMap :: BuildM BuildMap
 getBuildMap = gets buildDep
 
-getDependencies :: [NodeKey] -> BuildMap -> [BuildResult]
-getDependencies direct_deps build_map =
-  strictMap (expectJust . flip M.lookup build_map) direct_deps
+getDependencies :: IsTypecheck -> [NodeKey] -> BuildMap -> [BuildResult]
+getDependencies is_typecheck direct_deps build_map =
+  -- pprTrace "getDependencies1: " (ppr direct_deps <+> ppr is_typecheck) $
+  strictMap findKey direct_deps
+  where findKey k = expectJust $ (flip M.lookup build_map . NodeKeyWithIsTypeCheck is_typecheck) k
+
+getDependency :: IsTypecheck -> NodeKey -> BuildMap -> Maybe BuildResult
+getDependency is_typecheck direct_dep build_map =
+  M.lookup (NodeKeyWithIsTypeCheck is_typecheck direct_dep) build_map
 
 type BuildM a = StateT BuildLoopState IO a
 
 
+data NodeKeyWithIsTypeCheck = NodeKeyWithIsTypeCheck IsTypecheck NodeKey
+  deriving (Eq, Ord)
 
+updateNodeKeyWithIsTypeCheck :: (NodeKey -> NodeKey) -> NodeKeyWithIsTypeCheck -> NodeKeyWithIsTypeCheck
+updateNodeKeyWithIsTypeCheck f (NodeKeyWithIsTypeCheck is_typecheck nk) =
+  NodeKeyWithIsTypeCheck is_typecheck (f nk)
+data BuildPlanWithIsTypeCheck = BuildPlanWithIsTypeCheck
+  { _bpWithIsTypeCheck_is_typecheck :: IsTypecheck
+  , _bpWithIsTypeCheck_plan :: BuildPlan
+  }
+instance Outputable BuildPlanWithIsTypeCheck where
+  ppr (BuildPlanWithIsTypeCheck is_typecheck plan) =
+    text "BuildPlanWithIsTypeCheck" <+> ppr is_typecheck <+> ppr plan
 
+instance Outputable IsTypecheck where
+  ppr IsTypecheck = text "IsTypecheck"
+  ppr NotTypecheck = text "NotTypecheck"
 -- | Given the build plan, creates a graph which indicates where each NodeKey should
 -- get its direct dependencies from. This might not be the corresponding build action
 -- if the module participates in a loop. This step also labels each node with a number for the output.
 -- See Note [Upsweep] for a high-level description.
+liftBuildPlan :: [BuildPlan] -> [BuildPlanWithIsTypeCheck]
+liftBuildPlan bps = tcPlans ++ afTcPlans
+  where
+    filterTypecheckPlan plan@(SingleModule (ModuleNode _ _)) = Just $ buildPlanWithIsTypeCheck plan
+    filterTypecheckPlan plan@(SingleModule (UnitNode _ _)) = Just $ buildPlanWithIsTypeCheck plan
+    filterTypecheckPlan plan@(ResolvedCycle _) = Just $ buildPlanWithIsTypeCheck plan
+    filterTypecheckPlan _ = Nothing
+    buildPlanWithIsTypeCheck = BuildPlanWithIsTypeCheck IsTypecheck
+    tcPlans = mapMaybe filterTypecheckPlan bps
+    afTcPlans = map (\bp -> BuildPlanWithIsTypeCheck NotTypecheck bp) bps
+
+
 interpretBuildPlan :: HomeUnitGraph
                    -> Maybe ModIfaceCache
                    -> M.Map ModNodeKeyWithUid HomeModInfo
-                   -> [BuildPlan]
+                   -> [BuildPlanWithIsTypeCheck]
                    -> IO ( Maybe [ModuleGraphNode] -- Is there an unresolved cycle
                          , [MakeAction] -- Actions we need to run in order to build everything
-                         , IO [Maybe (Maybe HomeModInfo)]) -- An action to query to get all the built modules at the end.
+                         , IO [Maybe (Maybe ResultKind)]) -- An action to query to get all the built modules at the end.
 interpretBuildPlan hug mhmi_cache old_hpt plan = do
+  pprTraceM "interpretBuildPlan: built loop" (ppr plan)
   ((mcycle, plans), build_map) <- runStateT (buildLoop plan) (BuildLoopState M.empty 1)
+  -- ((mcycle, plans), build_map) <- runStateT (buildLoop undefined) (BuildLoopState M.empty 1)
+  -- build the loop twice, one for typecheck other for after typechecking
   let wait = collect_results (buildDep build_map)
   return (mcycle, plans, wait)
 
@@ -1016,7 +1063,9 @@ interpretBuildPlan hug mhmi_cache old_hpt plan = do
     collect_results build_map =
       sequence (map (\br -> collect_result (resultVar br)) (M.elems build_map))
       where
-        collect_result res_var = runMaybeT (waitResult res_var)
+        collect_result res_var = do
+          r <- runMaybeT (waitResult res_var)
+          return r
 
     -- Just used for an assertion
     count_mods :: BuildPlan -> Int
@@ -1027,44 +1076,46 @@ interpretBuildPlan hug mhmi_cache old_hpt plan = do
     count_m (UnitNode {}) = 0
     count_m _ = 1
 
-    n_mods = sum (map count_mods plan)
+    n_mods = sum (map count_mods $ map _bpWithIsTypeCheck_plan plan)
 
-    buildLoop :: [BuildPlan]
+    buildLoop :: [BuildPlanWithIsTypeCheck]
               -> BuildM (Maybe [ModuleGraphNode], [MakeAction])
     -- Build the abstract pipeline which we can execute
     -- Building finished
     buildLoop []           = return (Nothing, [])
-    buildLoop (plan:plans) =
+    buildLoop (BuildPlanWithIsTypeCheck it plan:plans) =
       case plan of
         -- If there was no cycle, then typecheckLoop is not necessary
         SingleModule m -> do
-          one_plan <- buildSingleModule Nothing NoLoop m
+          one_plan <- buildSingleModule it Nothing NoLoop m
           (cycle, all_plans) <- buildLoop plans
           return (cycle, one_plan : all_plans)
-
         -- For a resolved cycle, depend on everything in the loop, then update
         -- the cache to point to this node rather than directly to the module build
         -- nodes
         ResolvedCycle ms -> do
-          pipes <- buildModuleLoop ms
+          pipes <- buildModuleLoop it ms
           (cycle, graph) <- buildLoop plans
           return (cycle, pipes ++ graph)
 
         -- Can't continue past this point as the cycle is unresolved.
         UnresolvedCycle ns -> return (Just ns, [])
 
-    buildSingleModule :: Maybe [NodeKey]  -- Modules we need to rehydrate before compiling this module
+    buildSingleModule :: IsTypecheck
+                      -> Maybe [NodeKey]  -- Modules we need to rehydrate before compiling this module
                       -> ResultOrigin
                       -> ModuleGraphNode          -- The node we are compiling
                       -> BuildM MakeAction
-    buildSingleModule rehydrate_nodes origin mod = do
+    buildSingleModule it rehydrate_nodes origin mod = do
       !build_map <- getBuildMap
       -- 1. Get the direct dependencies of this module
       let direct_deps = mgNodeDependencies False mod
           -- It's really important to force build_deps, or the whole buildMap is retained,
           -- which would retain all the result variables, preventing us from collecting them
           -- after they are no longer used.
-          !build_deps = getDependencies direct_deps build_map
+          !build_deps = getDependencies it direct_deps build_map
+          !type_check_dep = getDependency IsTypecheck (mkNodeKey mod) build_map
+
       !build_action <-
             case mod of
               InstantiationNode uid iu -> do
@@ -1078,13 +1129,13 @@ interpretBuildPlan hug mhmi_cache old_hpt plan = do
                     rehydrate_mods = mapMaybe nodeKeyModName <$> rehydrate_nodes
                 mod_idx <- nodeId
                 return $ withCurrentUnit (mgNodeUnitId mod) $ do
-                     !_ <- wait_deps build_deps
-                     hmi <- executeCompileNode mod_idx n_mods old_hmi hug rehydrate_mods ms
-                     -- Write the HMI to an external cache (if one exists)
-                     -- See Note [Caching HomeModInfo]
-                     liftIO $ forM mhmi_cache $ \hmi_cache -> addHmiToCache hmi_cache hmi
-                     -- Make sure the result is written to the HPT var
-                     liftIO $ HUG.addHomeModInfoToHug hmi hug
+                    --  pprTraceM "buildSingleModule: " (ppr mod)
+                     !_ <- case it of
+                          IsTypecheck -> do
+                            -- pprTraceM "waiting for dependencies of " (ppr mod <+> ppr direct_deps)
+                            void $ wait_deps_with_trace (zip direct_deps build_deps)
+                          _ -> return ()
+                     hmi <- executeCompileNode it mhmi_cache type_check_dep mod_idx n_mods old_hmi hug rehydrate_mods ms
                      return (Just hmi)
               LinkNode _nks uid -> do
                   mod_idx <- nodeId
@@ -1097,29 +1148,47 @@ interpretBuildPlan hug mhmi_cache old_hpt plan = do
 
       res_var <- liftIO newEmptyMVar
       let result_var = mkResultVar res_var
-      setModulePipeline (mkNodeKey mod) (mkBuildResult origin result_var)
+      setModulePipeline (NodeKeyWithIsTypeCheck it $ mkNodeKey mod) (mkBuildResult origin result_var)
       return $! (MakeAction build_action res_var)
 
 
-    buildOneLoopyModule :: ModuleGraphNodeWithBootFile -> BuildM [MakeAction]
-    buildOneLoopyModule (ModuleGraphNodeWithBootFile mn deps) = do
-      ma <- buildSingleModule (Just deps) (Loop Initialise) mn
+    buildOneLoopyModule :: IsTypecheck -> ModuleGraphNodeWithBootFile -> BuildM [MakeAction]
+    buildOneLoopyModule it (ModuleGraphNodeWithBootFile mn deps) = do
+      ma <- buildSingleModule it (Just deps) (Loop Initialise) mn
       -- Rehydration (1) from Note [Hydrating Modules], "Loops with multiple boot files"
-      rehydrate_action <- rehydrateAction Rehydrated ((GWIB (mkNodeKey mn) IsBoot) : (map (\d -> GWIB d NotBoot) deps))
-      return $ [ma, rehydrate_action]
+      if it == IsTypecheck
+        then do
+          rehydrate_action <- rehydrateAction Rehydrated ((GWIB (mkNodeKey mn) IsBoot) : (map (\d -> GWIB d NotBoot) deps))
+          -- If we are typechecking, we need to rehydrate the boot file before typechecking the module
+          -- This is because the boot file might contain definitions which are used in the module.
+          -- See Note [Hydrating Modules]
+          return [ma, rehydrate_action]
+        else
+          -- If we are not typechecking, then we can just run the action and rehydrate afterwards.
+          -- This is because the boot file is not needed for linking.
+          return [ma]
 
 
-    buildModuleLoop :: [Either ModuleGraphNode ModuleGraphNodeWithBootFile] -> BuildM [MakeAction]
-    buildModuleLoop ms = do
-      build_modules <- concatMapM (either (fmap (:[]) <$> buildSingleModule Nothing (Loop Initialise)) buildOneLoopyModule) ms
+    buildModuleLoop :: IsTypecheck -> [Either ModuleGraphNode ModuleGraphNodeWithBootFile] -> BuildM [MakeAction]
+    buildModuleLoop it ms = do
+      build_modules <- concatMapM (either (fmap (:[]) <$> buildSingleModule it Nothing (Loop Initialise)) (buildOneLoopyModule it)) ms
       let extract (Left mn) = GWIB (mkNodeKey mn) NotBoot
           extract (Right (ModuleGraphNodeWithBootFile mn _)) = GWIB (mkNodeKey mn) IsBoot
       let loop_mods = map extract ms
       -- Rehydration (2) from Note [Hydrating Modules], "Loops with multiple boot files"
       -- Fixes the space leak described in that note.
-      rehydrate_action <- rehydrateAction Finalised loop_mods
-
-      return $ build_modules ++ [rehydrate_action]
+      if it == IsTypecheck
+        then do
+          -- If we are typechecking, we need to rehydrate the boot files before typechecking the module
+          -- This is because the boot file might contain definitions which are used in the module.
+          -- See Note [Hydrating Modules]
+          rehydrate_action <- rehydrateAction Finalised loop_mods
+          return $ build_modules ++ [rehydrate_action]
+        else do
+          -- If we are not typechecking, then we can just run the action and rehydrate afterwards.
+          -- This is because the boot file is not needed for linking.
+          -- See Note [Hydrating Modules]
+          return build_modules
 
     -- An action which rehydrates the given keys
     rehydrateAction :: ResultLoopOrigin -> [GenWithIsBoot NodeKey] -> BuildM MakeAction
@@ -1128,20 +1197,24 @@ interpretBuildPlan hug mhmi_cache old_hpt plan = do
       res_var <- liftIO newEmptyMVar
       let loop_unit :: UnitId
           !loop_unit = nodeKeyUnitId (gwib_mod (head deps))
-          !build_deps = getDependencies (map gwib_mod deps) build_map
+          !build_deps = getDependencies IsTypecheck (map gwib_mod deps) build_map
       let loop_action = withCurrentUnit loop_unit $ do
-            !_ <- wait_deps build_deps
+            pprTraceM "rehydrateAction: " (ppr deps)
+            !depsResult <- wait_deps build_deps
+            pprTraceM "rehydrateAction1: " (ppr ())
             hsc_env <- asks hsc_env
-            let mns :: [ModuleName]
-                mns = mapMaybe (nodeKeyModName . gwib_mod) deps
-
-            hmis' <- liftIO $ rehydrateAfter hsc_env mns
+            -- let mns :: [ModuleName]
+            --     mns = mapMaybe (nodeKeyModName . gwib_mod) deps
+            hmis' <- liftIO $ rehydrateAfter hsc_env deps
+            -- pprTraceM "rehydrateAction2: " (ppr deps)
 
             checkRehydrationInvariant hmis' deps
+            -- pprTraceM "rehydrateAction3: " (ppr deps)
 
             -- Add hydrated interfaces to global variable
             liftIO $ mapM_ (\hmi -> HUG.addHomeModInfoToHug hmi hug) hmis'
-            return hmis'
+
+            return $ zipWith updateResultKind hmis' depsResult
 
       let fanout i = Just . (!! i) <$> mkResultVar res_var
       -- From outside the module loop, anyone must wait for the loop to finish and then
@@ -1157,9 +1230,9 @@ interpretBuildPlan hug mhmi_cache old_hpt plan = do
               IsBoot -> do
                 setModulePipeline (gwib_mod m) (mkBuildResult (Loop origin) (fanout i))
                 -- SPECIAL: Anything outside the loop needs to see A rather than A.hs-boot
-                setModulePipeline (boot_key (gwib_mod m)) (mkBuildResult (Loop origin) (fanout i))
+                setModulePipeline (updateNodeKeyWithIsTypeCheck boot_key (gwib_mod m)) (mkBuildResult (Loop origin) (fanout i))
 
-      let deps_i = zip deps [0..]
+      let deps_i =  zip (fmap (NodeKeyWithIsTypeCheck IsTypecheck) <$> deps) [0..]
       mapM update_module_pipeline deps_i
 
       return $ MakeAction loop_action res_var
@@ -1184,9 +1257,9 @@ upsweep
     -> Maybe Messager
     -> M.Map ModNodeKeyWithUid HomeModInfo
     -> [BuildPlan]
-    -> IO (SuccessFlag, [HomeModInfo])
+    -> IO (SuccessFlag, [ResultKind])
 upsweep n_jobs hsc_env hmi_cache diag_wrapper mHscMessage old_hpt build_plan = do
-    (cycle, pipelines, collect_result) <- interpretBuildPlan (hsc_HUG hsc_env) hmi_cache old_hpt build_plan
+    (cycle, pipelines, collect_result) <- interpretBuildPlan (hsc_HUG hsc_env) hmi_cache old_hpt $ liftBuildPlan build_plan
     runPipelines n_jobs hsc_env diag_wrapper mHscMessage pipelines
     res <- collect_result
 
@@ -1213,24 +1286,29 @@ upsweep_inst :: HscEnv
              -> IO ()
 upsweep_inst hsc_env mHscMessage mod_index nmods uid iuid = do
         case mHscMessage of
-            Just hscMessage -> hscMessage hsc_env (mod_index, nmods) (NeedsRecompile MustCompile) (InstantiationNode uid iuid)
+            Just hscMessage -> hscMessage hsc_env (mod_index, nmods) (NeedsRecompile MustCompile) (InstantiationNode uid iuid, NotTypecheck)
             Nothing -> return ()
         runHsc hsc_env $ ioMsgMaybe $ hoistTcRnMessage $ tcRnCheckUnit hsc_env $ VirtUnit iuid
         pure ()
-
+data UpSweepContext = UpSTc | UpSCompile NeedComilePlan
+instance Eq UpSweepContext where
+    UpSTc == UpSTc = True
+    _ == _ = False
 -- | Compile a single module.  Always produce a Linkable for it if
 -- successful.  If no compilation happened, return the old Linkable.
-upsweep_mod :: HscEnv
+upsweep_mod :: UpSweepContext
+            -> HscEnv
             -> Maybe Messager
             -> Maybe HomeModInfo
             -> ModSummary
             -> Int  -- index of module
             -> Int  -- total number of modules
-            -> IO HomeModInfo
-upsweep_mod hsc_env mHscMessage old_hmi summary mod_index nmods =  do
-  hmi <- compileOne' mHscMessage hsc_env summary
-          mod_index nmods (hm_iface <$> old_hmi) (maybe emptyHomeModInfoLinkable hm_linkable old_hmi)
-
+            -> IO ResultKind
+upsweep_mod UpSTc hsc_env mHscMessage old_hmi summary mod_index nmods = do
+  (a, b) <- typeCheckOne mHscMessage hsc_env summary mod_index nmods (hm_iface <$> old_hmi) (maybe emptyHomeModInfoLinkable hm_linkable old_hmi)
+  return $ TypecheckResult b a
+upsweep_mod (UpSCompile needComp) hsc_env mHscMessage old_hmi summary mod_index nmods =  do
+  hmi <- afterTypecheckOne mHscMessage hsc_env needComp summary mod_index nmods (hm_iface <$> old_hmi) (maybe emptyHomeModInfoLinkable hm_linkable old_hmi)
   -- MP: This is a bit janky, because before you add the entries you have to extend the HPT with the module
   -- you just compiled. Another option, would be delay adding anything until after upsweep has finished, but I
   -- am unsure if this is sound (wrt running TH splices for example).
@@ -1241,8 +1319,7 @@ upsweep_mod hsc_env mHscMessage old_hmi summary mod_index nmods =  do
   hscInsertHPT hmi hsc_env
   addSptEntries (hsc_env)
                 (homeModInfoByteCode hmi)
-
-  return hmi
+  return $ CompiledResult hmi
 
 -- | Add the entries from a BCO linkable to the SPT table, see
 -- See Note [Grand plan for static forms] in GHC.Iface.Tidy.StaticPtrTable.
@@ -1586,22 +1663,49 @@ executeInstantiationNode k n deps uid iu = do
 -- 2. If the ModuleNode is a ModuleNodeFixed, then we just need to load the interface
 --    and artifacts from disk.
 
-executeCompileNode :: Int
+executeCompileNode ::
+  IsTypecheck
+  -> Maybe ModIfaceCache
+  -> Maybe BuildResult
+  -> Int
   -> Int
   -> Maybe HomeModInfo
   -> HomeUnitGraph
   -> Maybe [ModuleName] -- List of modules we need to rehydrate before compiling
   -> ModuleNodeInfo
-  -> RunMakeM HomeModInfo
-executeCompileNode k n !old_hmi hug mrehydrate_mods mni = do
+  -> RunMakeM ResultKind
+executeCompileNode it mhmi_cache br k n !old_hmi hug mrehydrate_mods mni = do
   me@MakeEnv{..} <- ask
   -- Rehydrate any dependencies if this module had a boot file or is a signature file.
-  lift $ MaybeT (withAbstractSem compile_sem $ withLoggerHsc k me $ \hsc_env -> do
-     hsc_env' <- liftIO $ maybeRehydrateBefore (setHUG hug hsc_env) mni fixed_mrehydrate_mods
-     case mni of
-       ModuleNodeCompile mod -> executeCompileNodeWithSource hsc_env' me  mod
-       ModuleNodeFixed key loc -> executeCompileNodeFixed hsc_env' me key loc
+  -- wait for typechecking to finish
+  compileNode <- case (mni, it, br) of
+        (ModuleNodeCompile mod, NotTypecheck, Just lpr) -> do
+          res <- wait_dep lpr
+          case res of
+             TypecheckResult bp _ -> return $ \hsc_env' -> executeCompileNodeWithSource (UpSCompile bp) hsc_env' me mod
+             _ -> throwGhcException $ ProgramError "Expected TypecheckResult"
+        (ModuleNodeFixed key loc, _, _) -> return $ \hsc_env' -> executeCompileNodeFixed hsc_env' me key loc
+        (ModuleNodeCompile mod, _, _) -> return $ \hsc_env' -> executeCompileNodeWithSource UpSTc hsc_env' me mod
+  hmi <- lift $ MaybeT (withAbstractSem compile_sem $ withLoggerHsc k me $ \hsc_env -> do
+     hsc_env' <- if it == IsTypecheck
+                 then liftIO (maybeRehydrateBefore (setHUG hug hsc_env) mni fixed_mrehydrate_mods)
+                 else return hsc_env
+     pprTraceM "executeCompileNode" (ppr $ moduleNodeInfoModNodeKeyWithUid mni)
+     r <- compileNode hsc_env'
+     pprTraceM "executeCompileNode finish:" (ppr $ moduleNodeInfoModNodeKeyWithUid mni)
+     return r
     )
+
+  let getHmi (TypecheckResult _ hmi) = hmi
+      getHmi (CompiledResult hmi)  = hmi
+      addResult rk = do
+        let hmi = getHmi rk
+        liftIO (forM_ mhmi_cache $ \hmi_cache -> addHmiToCache hmi_cache hmi)
+        liftIO (HUG.addHomeModInfoToHug hmi hug)
+  -- Write the HMI to an external cache (if one exists)
+  -- See Note [Caching HomeModInfo]
+  addResult hmi
+  return hmi
 
   where
     fixed_mrehydrate_mods =
@@ -1612,10 +1716,10 @@ executeCompileNode k n !old_hmi hug mrehydrate_mods mni = do
         Just HsigFile -> Just []
         _        -> mrehydrate_mods
 
-    executeCompileNodeFixed :: HscEnv -> MakeEnv -> ModNodeKeyWithUid -> ModLocation -> IO (Maybe HomeModInfo)
+    executeCompileNodeFixed :: HscEnv -> MakeEnv -> ModNodeKeyWithUid -> ModLocation -> IO (Maybe ResultKind)
     executeCompileNodeFixed hsc_env MakeEnv{diag_wrapper, env_messager} mod loc =
       wrapAction diag_wrapper hsc_env $ do
-        forM_ env_messager $ \hscMessage -> hscMessage hsc_env (k, n) UpToDate (ModuleNode [] (ModuleNodeFixed mod loc))
+        forM_ env_messager $ \hscMessage -> hscMessage hsc_env (k, n) UpToDate (ModuleNode [] (ModuleNodeFixed mod loc), NotTypecheck)
         read_result <- readIface (hsc_logger hsc_env) (hsc_dflags hsc_env) (hsc_NC hsc_env) (mnkToModule mod) (ml_hi_file loc)
         case read_result of
           M.Failed interface_err ->
@@ -1627,10 +1731,10 @@ executeCompileNode k n !old_hmi hug mrehydrate_mods mni = do
             mb_object <- findObjectLinkableMaybe (mi_module iface) loc
             mb_bytecode <- loadIfaceByteCodeLazy hsc_env iface loc (md_types details)
             let hm_linkable = HomeModLinkable mb_bytecode mb_object
-            return (HomeModInfo iface details hm_linkable)
+            return $ CompiledResult (HomeModInfo iface details hm_linkable)
 
-    executeCompileNodeWithSource :: HscEnv -> MakeEnv -> ModSummary -> IO (Maybe HomeModInfo)
-    executeCompileNodeWithSource hsc_env MakeEnv{diag_wrapper, env_messager} mod = do
+    executeCompileNodeWithSource :: UpSweepContext -> HscEnv -> MakeEnv -> ModSummary -> IO (Maybe ResultKind)
+    executeCompileNodeWithSource it hsc_env MakeEnv{diag_wrapper, env_messager} mod = do
      let -- Use the cached DynFlags which includes OPTIONS_GHC pragmas
          lcl_dynflags = ms_hspp_opts mod
      let lcl_hsc_env =
@@ -1640,8 +1744,9 @@ executeCompileNode k n !old_hmi hug mrehydrate_mods mni = do
      -- Compile the module, locking with a semaphore to avoid too many modules
      -- being compiled at the same time leading to high memory usage.
      wrapAction diag_wrapper lcl_hsc_env $ do
-      res <- upsweep_mod lcl_hsc_env env_messager old_hmi mod k n
-      cleanCurrentModuleTempFilesMaybe (hsc_logger hsc_env) (hsc_tmpfs hsc_env) lcl_dynflags
+      res <- upsweep_mod it lcl_hsc_env env_messager old_hmi mod k n
+      when (it /= UpSTc) $
+        cleanCurrentModuleTempFilesMaybe (hsc_logger hsc_env) (hsc_tmpfs hsc_env) lcl_dynflags
       return res
 
 
@@ -1687,11 +1792,11 @@ maybeRehydrateBefore hsc_env mni (Just mns) = do
     in mkModuleEnv . (:[]) . (mod_name,) <$> newIORef emptyTypeEnv
 
 rehydrateAfter :: HscEnv
-  -> [ModuleName]
+  -> [GenWithIsBoot NodeKey]
   -> IO [HomeModInfo]
 rehydrateAfter hsc mns = do
   let hpt = hsc_HPT hsc
-  hmis <- mapM (fmap expectJust . lookupHpt hpt) mns
+  hmis <- mapM (fmap expectJust . lookupHpt hpt . expectJust . nodeKeyModName . gwib_mod) mns
   rehydrate (hsc { hsc_type_env_vars = emptyKnotVars }) hmis
 
 {-
@@ -1869,7 +1974,7 @@ executeLinkNode hug kn uid deps = do
     MakeEnv{..} <- ask
     let dflags = hsc_dflags hsc_env
     let hsc_env' = setHUG hug hsc_env
-        msg' = (\messager -> \recomp -> messager hsc_env kn recomp (LinkNode deps uid)) <$> env_messager
+        msg' = (\messager -> \recomp -> messager hsc_env kn recomp (LinkNode deps uid, NotTypecheck)) <$> env_messager
 
     linkresult <- liftIO $ withAbstractSem compile_sem $ do
                             link (ghcLink dflags)
@@ -1885,9 +1990,19 @@ executeLinkNode hug kn uid deps = do
     case linkresult of
       Failed -> fail "Link Failed"
       Succeeded -> return ()
+wait_deps_with_trace :: [(NodeKey, BuildResult)] -> RunMakeM [ResultKind]
+wait_deps_with_trace [] = return []
+wait_deps_with_trace ((node,x):xs) = do
+  res <- lift $ waitResult (resultVar x)
+  pprTraceM "Waiting for dependency: " $ ppr node
+  hmis <- wait_deps_with_trace xs
+  pprTraceM "Finished waiting for dependency: " $ ppr node
+  case res of
+    Nothing -> return hmis
+    Just hmi -> return (hmi:hmis)
 
 -- | Wait for dependencies to finish, and then return their results.
-wait_deps :: [BuildResult] -> RunMakeM [HomeModInfo]
+wait_deps :: [BuildResult] -> RunMakeM [ResultKind]
 wait_deps [] = return []
 wait_deps (x:xs) = do
   res <- lift $ waitResult (resultVar x)
@@ -1896,6 +2011,10 @@ wait_deps (x:xs) = do
     Nothing -> return hmis
     Just hmi -> return (hmi:hmis)
 
+wait_dep :: BuildResult -> RunMakeM ResultKind
+wait_dep x = do
+  res <- lift $ waitResult (resultVar x)
+  return $ expectJust res
 
 {- Note [GHC Heap Invariants]
    ~~~~~~~~~~~~~~~~~~~~~~~~~~
