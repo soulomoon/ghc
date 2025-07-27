@@ -232,6 +232,8 @@ function set_toolchain_paths() {
   echo "  ALEX: $(which alex)"
   echo "  OPT: $(which opt)"
   echo "  LLC: $(which llc)"
+  echo "  LLVMAS: $LLVMAS"
+  echo "  clang: $(which clang)"
 
   export GHC
   export CABAL

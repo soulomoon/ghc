@@ -99,3 +99,11 @@ jobs:
 
       - name: Hadrian test
         run: . .gitlab/ci.sh test_hadrian
+
+      - name: Upload config.log
+        uses: actions/upload-artifact@v4
+        with:
+          name: config-log
+          path: libraries/time/config.log
+
+
