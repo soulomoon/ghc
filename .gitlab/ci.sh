@@ -230,6 +230,8 @@ function set_toolchain_paths() {
   echo "  GHC: $(which ghc)"
   echo "  HAPPY: $(which happy)"
   echo "  ALEX: $(which alex)"
+  echo "  OPT: $(which opt)"
+  echo "  LLC: $(which llc)"
 
   export GHC
   export CABAL
