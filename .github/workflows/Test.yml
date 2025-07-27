@@ -81,7 +81,7 @@ jobs:
 
       - uses: nicknovitski/nix-develop@main
         with:
-            arguments: "git+https://github.com/soulomoon/ghc.nix#llvm --accept-flake-config"
+            arguments: "git+https://github.com/soulomoon/ghc.nix#llvm --accept-flake-config -c bash"
 
 
       - name: Hadrian setup
