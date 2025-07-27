@@ -85,7 +85,9 @@ jobs:
 
 
       - name: Hadrian setup
-        run: . .gitlab/ci.sh setup
+        run: |
+          rm /usr/bin/clang
+          . .gitlab/ci.sh setup
 
       - name: Hadrian configure
         run: . .gitlab/ci.sh configure
