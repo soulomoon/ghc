@@ -103,9 +103,10 @@ jobs:
         run: . .gitlab/ci.sh test_hadrian
 
       - name: Upload config.log
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: config-log
-          path: libraries/time/config.log
+          path: _build/stage0/libraries/time/build/config.log
 
 
