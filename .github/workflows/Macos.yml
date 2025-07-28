@@ -33,7 +33,7 @@ jobs:
   #         swap-storage: true
 
   hadrian-build-build:
-    runs-on: macos-15-large
+    runs-on: macos-latest
     permissions:
       id-token: "write"
       contents: "read"
