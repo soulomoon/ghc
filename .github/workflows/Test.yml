@@ -1,4 +1,4 @@
-name: Test Hadrian GHC-in-GHCi
+name: Test CI
 
 on: push
   # push:
