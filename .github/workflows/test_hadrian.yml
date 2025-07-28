@@ -53,6 +53,9 @@ jobs:
       - name: Hadrian setup
         run: |
           git submodule update --init
+          cabal update
+          cabal install happy-1.20.1.1 --overwrite-policy=always
+          cabal install alex
           ./boot
 
       - name: Hadrian configure
