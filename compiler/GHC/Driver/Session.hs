@@ -162,6 +162,7 @@ module GHC.Driver.Session (
         updOptLevel,
         setTmpDir,
         setUnitId,
+        setHomeUnitId,
 
         TurnOnFlag,
         turnOn,
@@ -2265,7 +2266,9 @@ wWarningFlagsDeps = [minBound..maxBound] >>= \x -> case x of
   Opt_WarnAmbiguousFields -> warnSpec x
   Opt_WarnAutoOrphans -> depWarnSpec x "it has no effect"
   Opt_WarnCPPUndef -> warnSpec x
-  Opt_WarnBadlyStagedTypes -> warnSpec x
+  Opt_WarnBadlyLevelledTypes ->
+    warnSpec x ++
+    subWarnSpec "badly-staged-types" x "it is renamed to -Wbadly-levelled-types"
   Opt_WarnUnbangedStrictPatterns -> warnSpec x
   Opt_WarnDeferredTypeErrors -> warnSpec x
   Opt_WarnDeferredOutOfScopeVariables -> warnSpec x
@@ -2379,12 +2382,15 @@ wWarningFlagsDeps = [minBound..maxBound] >>= \x -> case x of
   Opt_WarnImplicitRhsQuantification -> warnSpec x
   Opt_WarnIncompleteExportWarnings -> warnSpec x
   Opt_WarnIncompleteRecordSelectors -> warnSpec x
-  Opt_WarnDataKindsTC -> warnSpec x
+  Opt_WarnDataKindsTC
+    -> depWarnSpec x "DataKinds violations are now always an error"
   Opt_WarnDefaultedExceptionContext -> warnSpec x
   Opt_WarnViewPatternSignatures -> warnSpec x
   Opt_WarnUselessSpecialisations -> warnSpec x
   Opt_WarnDeprecatedPragmas -> warnSpec x
   Opt_WarnRuleLhsEqualities -> warnSpec x
+  Opt_WarnUnusableUnpackPragmas -> warnSpec x
+  Opt_WarnPatternNamespaceSpecifier -> warnSpec x
 
 warningGroupsDeps :: [(Deprecation, FlagSpec WarningGroup)]
 warningGroupsDeps = map mk warningGroups
@@ -2498,6 +2504,9 @@ fFlagsDeps = [
   -- wasm ghci browser mode
   flagGhciSpec "ghci-browser"                 Opt_GhciBrowser,
   flagGhciSpec "ghci-browser-redirect-wasi-console" Opt_GhciBrowserRedirectWasiConsole,
+
+  -- load all targets on GHCi startup
+  flagGhciSpec "load-initial-targets"         Opt_GhciDoLoadTargets,
 
   flagSpec "helpful-errors"                   Opt_HelpfulErrors,
   flagSpec "hpc"                              Opt_Hpc,
@@ -3111,6 +3120,9 @@ parseUnitArg =
 setUnitId :: String -> DynFlags -> DynFlags
 setUnitId p d = d { homeUnitId_ = stringToUnitId p }
 
+setHomeUnitId :: UnitId -> DynFlags -> DynFlags
+setHomeUnitId p d = d { homeUnitId_ = p }
+
 setWorkingDirectory :: String -> DynFlags -> DynFlags
 setWorkingDirectory p d = d { workingDirectory =  Just p }
 
@@ -3451,6 +3463,7 @@ compilerInfo dflags
        ("Project Patch Level1",        cProjectPatchLevel1),
        ("Project Patch Level2",        cProjectPatchLevel2),
        ("Project Unit Id",             cProjectUnitId),
+       ("ghc-internal Unit Id",        cGhcInternalUnitId), -- See Note [Special unit-ids]
        ("Booter version",              cBooterVersion),
        ("Stage",                       cStage),
        ("Build platform",              cBuildPlatformString),
@@ -3503,6 +3516,26 @@ compilerInfo dflags
     useInplaceMinGW = toolSettings_useInplaceMinGW $ toolSettings dflags
     expandDirectories :: FilePath -> Maybe FilePath -> String -> String
     expandDirectories topd mtoold = expandToolDir useInplaceMinGW mtoold . expandTopDir topd
+
+-- Note [Special unit-ids]
+-- ~~~~~~~~~~~~~~~~~~~~~~~
+-- Certain units are special to the compiler:
+-- - Wired-in identifiers reference a specific unit-id of `ghc-internal`.
+-- - GHC plugins must be linked against a specific unit-id of `ghc`,
+--   namely the same one as the compiler.
+-- - When using Template Haskell, the result of executing splices refer to
+--   the Template Haskell ASTs created using constructors from `ghc-internal`,
+--   and must be linked against the same `ghc-internal` unit-id as the compiler.
+--
+-- We therefore expose the unit-id of `ghc-internal` ("ghc-internal Unit Id") and
+-- ghc ("Project Unit Id") through `ghc --info`.
+--
+-- This allows build tools to act accordingly, eg, if a user wishes to build a
+-- GHC plugin, `cabal-install` might force them to use the exact `ghc` unit
+-- that the compiler was linked against.
+-- See:
+--  - https://github.com/haskell/cabal/issues/10087
+--  - https://github.com/commercialhaskell/stack/issues/6749
 
 {- -----------------------------------------------------------------------------
 Note [DynFlags consistency]
@@ -3648,6 +3681,14 @@ makeDynFlagsConsistent dflags
  | LinkMergedObj <- ghcLink dflags
  , Nothing <- outputFile dflags
     = pgmError "--output must be specified when using --merge-objs"
+
+ | platformTablesNextToCode platform
+   && os == OSMinGW32
+   && arch == ArchAArch64
+    = case backendCodeOutput (backend dflags) of
+        LlvmCodeOutput -> pgmError "-fllvm is incompatible with enabled TablesNextToCode at Windows Aarch64"
+        NcgCodeOutput -> pgmError "-fasm is incompatible with enabled TablesNextToCode at Windows Aarch64"
+        _ -> (dflags, mempty, mempty)
 
   -- When we do ghci, force using dyn ways if the target RTS linker
   -- only supports dynamic code

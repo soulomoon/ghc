@@ -87,6 +87,9 @@ data DocPaths = DocPaths
   -- ^ path to hyperlinked sources
   }
 type WarningMap = Map Name (Doc Name)
+type ExportedNames = Set.Set Name
+type Modules = Set.Set Module
+type ExportInfo = (ExportedNames, Modules)
 
 -----------------------------------------------------------------------------
 
@@ -131,6 +134,9 @@ data Interface = Interface
   -- Names from modules that are entirely re-exported don't count as visible.
   , ifaceInstances :: [ClsInst]
   -- ^ Instances exported by the module.
+  , ifaceOrphanDeps :: [Module]
+  -- ^ The list of modules to check for orphan instances if this module is
+  -- imported.
   , ifaceOrphanInstances :: [DocInstance GhcRn]
   -- ^ Orphan instances
   , ifaceRnOrphanInstances :: [DocInstance DocNameI]
@@ -697,6 +703,9 @@ data DocOption
   | -- | Render runtime reps for this module (see
     -- the GHC @-fprint-explicit-runtime-reps@ flag)
     OptPrintRuntimeRep
+  | -- | Hide the RHS of type synonyms in this module
+    -- that use unexported types.
+    OptRedactTypeSyns
   deriving (Eq, Show)
 
 -- | Option controlling how to qualify names
@@ -873,6 +882,8 @@ data HsTypeDocNameIExt
                 (LHsType DocNameI)
 
   | HsRecTy     [LHsConDeclRecField DocNameI]
+
+  | HsRedacted  (HsType DocNameI) -- ^ contains the kind of the redacted type
 
 type instance XNumTy DocNameI = NoExtField
 type instance XStrTy DocNameI = NoExtField

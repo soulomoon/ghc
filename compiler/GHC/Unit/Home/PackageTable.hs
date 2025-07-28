@@ -41,7 +41,6 @@ module GHC.Unit.Home.PackageTable
     -- * Queries about home modules
   , hptCompleteSigs
   , hptAllInstances
-  , hptAllFamInstances
   , hptAllAnnotations
 
     -- ** More Traversal-based queries
@@ -208,14 +207,6 @@ hptAllInstances hpt = do
   let (insts, famInsts) = unzip hits
   return (foldl' unionInstEnv emptyInstEnv insts, concat famInsts)
 
--- | Find all the family instance declarations from the HPT
-hptAllFamInstances :: HomePackageTable -> IO (ModuleEnv FamInstEnv)
-hptAllFamInstances = fmap mkModuleEnv . concatHpt (\hmi -> [(hmiModule hmi, hmiFamInstEnv hmi)])
-  where
-    hmiModule     = mi_module . hm_iface
-    hmiFamInstEnv = extendFamInstEnvList emptyFamInstEnv
-                      . md_fam_insts . hm_details
-
 -- | All annotations from the HPT
 hptAllAnnotations :: HomePackageTable -> IO AnnEnv
 hptAllAnnotations = fmap mkAnnEnv . concatHpt (md_anns . hm_details)
@@ -232,7 +223,7 @@ hptAllAnnotations = fmap mkAnnEnv . concatHpt (md_anns . hm_details)
 -- ever want to collect *all* dependencies. The current caller of this function
 -- currently takes all dependencies only to then filter them with an ad-hoc transitive closure check.
 -- See #25639
-hptCollectDependencies :: HomePackageTable -> IO (Set.Set UnitId)
+hptCollectDependencies :: HomePackageTable -> IO (Set.Set (IfaceImportLevel, UnitId))
 hptCollectDependencies HPT{table} = do
   hpt <- readIORef table
   return $

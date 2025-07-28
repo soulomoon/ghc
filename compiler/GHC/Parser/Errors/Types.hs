@@ -207,6 +207,9 @@ data PsMessage
    -- | Import: multiple occurrences of 'qualified'
    | PsErrImportQualifiedTwice
 
+   -- | Multiple occurrences of a splice or quote keyword
+   | PsErrSpliceOrQuoteTwice
+
    -- | Post qualified import without 'ImportQualifiedPost'
    | PsErrImportPostQualified
 
@@ -507,6 +510,11 @@ data PsMessage
    -- This constructor is deprecated and will be removed in GHC 9.18.
    | PsWarnSpecMultipleTypeAscription
 
+   -- | The deprecated ``pattern`` namespace specifier was used in an import or
+   -- export list. Suggested fix: use the ``data`` keyword instead.
+   | PsWarnPatternNamespaceSpecifier
+      !Bool -- ^ Is ExplicitNamespaces on?
+
    deriving Generic
 
 -- | Extra details about a parse error, which helps
@@ -608,6 +616,7 @@ data LexErr
    | LexUnterminatedComment -- ^ Unterminated `{-'
    | LexUnterminatedOptions -- ^ Unterminated OPTIONS pragma
    | LexUnterminatedQQ      -- ^ Unterminated quasiquotation
+   deriving (Show,Eq,Ord)
 
 -- | Errors from the Cmm parser
 data CmmParserError

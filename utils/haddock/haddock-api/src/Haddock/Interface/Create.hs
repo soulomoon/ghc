@@ -59,6 +59,7 @@ import GHC.Types.Name.Set
 import GHC.Types.SafeHaskell
 import qualified GHC.Types.SrcLoc as SrcLoc
 import qualified GHC.Types.Unique.Map as UniqMap
+import GHC.Unit.Module.Deps (dep_orphs)
 import GHC.Unit.Module.ModIface
 import GHC.Unit.State (PackageName (..), UnitState)
 import GHC.Utils.Outputable (SDocContext)
@@ -270,6 +271,7 @@ createInterface1' flags unit_state dflags hie_file mod_iface ifaces inst_ifaces 
       , ifaceVisibleExports = visible_names
       , ifaceFixMap = fixities
       , ifaceInstances = instances
+      , ifaceOrphanDeps = dep_orphs $ mi_deps mod_iface
       , ifaceOrphanInstances = [] -- Filled in attachInstances
       , ifaceRnOrphanInstances = [] -- Filled in renameInterfaceRn
       , ifaceHaddockCoverage = coverage
@@ -395,6 +397,7 @@ parseOption "prune" = return (Just OptPrune)
 parseOption "not-home" = return (Just OptNotHome)
 parseOption "show-extensions" = return (Just OptShowExtensions)
 parseOption "print-explicit-runtime-reps" = return (Just OptPrintRuntimeRep)
+parseOption "redact-type-synonyms" = return (Just OptRedactTypeSyns)
 parseOption other = warn ("Unrecognised option: " ++ other) >> return Nothing
 
 --------------------------------------------------------------------------------

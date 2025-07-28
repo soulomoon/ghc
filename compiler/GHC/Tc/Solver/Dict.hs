@@ -904,7 +904,7 @@ checkInstanceOK :: CtLoc -> InstanceWhat -> TcPredType -> TcS CtLoc
 -- Returns the CtLoc to used for sub-goals
 -- Probably also want to call checkReductionDepth
 checkInstanceOK loc what pred
-  = do { checkWellStagedDFun loc what pred
+  = do { checkWellLevelledDFun loc what pred
        ; return deeper_loc }
   where
      deeper_loc = zap_origin (bumpCtLocDepth loc)
@@ -926,7 +926,8 @@ matchClassInst dflags inerts clas tys loc
 -- First check whether there is an in-scope Given that could
 -- match this constraint.  In that case, do not use any instance
 -- whether top level, or local quantified constraints.
--- See Note [Instance and Given overlap]
+-- See Note [Instance and Given overlap] and see
+-- (IL0) in Note [Rules for instance lookup] in GHC.Core.InstEnv
   | not (xopt LangExt.IncoherentInstances dflags)
   , not (isCTupleClass clas)
         -- It is always safe to unpack constraint tuples

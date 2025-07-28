@@ -637,3 +637,7 @@ test('T25083', [extra_files(['T25083_A.hs', 'T25083_B.hs'])], multimod_compile_a
 test('T25174', normal, compile, [''])
 test('T25179', normal, compile, [''])
 test('FunNameTH', normal, compile, [''])
+test('QQInQuote', normal, compile, [''])
+test('QQTopError', normal, compile_fail, ['-fdiagnostics-show-caret'])
+test('GadtConSigs_th_pprint1', normal, compile, [''])
+test('GadtConSigs_th_dump1', normal, compile, ['-v0 -ddump-splices -dsuppress-uniques'])

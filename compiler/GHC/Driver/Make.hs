@@ -116,6 +116,7 @@ import qualified Control.Monad.Catch as MC
 import Data.IORef
 import Data.Maybe
 import Data.List (sortOn, groupBy, sortBy)
+import qualified Data.List as List
 import System.FilePath
 
 import Control.Monad.IO.Class
@@ -190,12 +191,12 @@ depanalE diag_wrapper msg excluded_mods allow_dup_roots = do
 
         all_errs <- liftIO $ HUG.unitEnv_foldWithKey one_unit_messages (return emptyMessages) (hsc_HUG hsc_env)
         logDiagnostics (GhcDriverMessage <$> all_errs)
-        setSession hsc_env { hsc_mod_graph = mod_graph }
+        setSession (setModuleGraph mod_graph hsc_env)
         pure (emptyMessages, mod_graph)
       else do
         -- We don't have a complete module dependency graph,
         -- The graph may be disconnected and is unusable.
-        setSession hsc_env { hsc_mod_graph = emptyMG }
+        setSession (setModuleGraph emptyMG hsc_env)
         pure (errs, emptyMG)
 
 
@@ -343,8 +344,9 @@ warnUnknownModules hsc_env dflags mod_graph = do
 data LoadHowMuch
    = LoadAllTargets
      -- ^ Load all targets and its dependencies.
-   | LoadUpTo HomeUnitModule
-     -- ^ Load only the given module and its dependencies.
+   | LoadUpTo [HomeUnitModule]
+     -- ^ Load only the given modules and its dependencies.
+     -- If empty, we load none of the targets
    | LoadDependenciesOf HomeUnitModule
      -- ^ Load only the dependencies of the given module, but not the module
      -- itself.
@@ -458,7 +460,7 @@ warnUnusedPackages us dflags mod_graph =
 
     -- Only need non-source imports here because SOURCE imports are always HPT
         loadedPackages = concat $
-          mapMaybe (\(fs, mn) -> lookupModulePackage us (unLoc mn) fs)
+          mapMaybe (\(_st, fs, mn) -> lookupModulePackage us (unLoc mn) fs)
             $ concatMap ms_imps home_mod_sum
 
         used_args = Set.fromList (map unitId loadedPackages)
@@ -517,16 +519,17 @@ countMods (ResolvedCycle ns) = length ns
 countMods (UnresolvedCycle ns) = length ns
 
 -- See Note [Upsweep] for a high-level description.
-createBuildPlan :: ModuleGraph -> Maybe HomeUnitModule -> [BuildPlan]
+createBuildPlan :: ModuleGraph -> Maybe [HomeUnitModule] -> [BuildPlan]
 createBuildPlan mod_graph maybe_top_mod =
     let -- Step 1: Compute SCCs without .hi-boot files, to find the cycles
-        cycle_mod_graph = topSortModuleGraph True mod_graph maybe_top_mod
+        cycle_mod_graph   = topSortModuleGraph True  mod_graph maybe_top_mod
+        acyclic_mod_graph = topSortModuleGraph False mod_graph maybe_top_mod
 
         -- Step 2: Reanalyse loops, with relevant boot modules, to solve the cycles.
         build_plan :: [BuildPlan]
         build_plan
           -- Fast path, if there are no boot modules just do a normal toposort
-          | isEmptyModuleEnv boot_modules = collapseAcyclic $ topSortModuleGraph False mod_graph maybe_top_mod
+          | isEmptyModuleEnv boot_modules = collapseAcyclic acyclic_mod_graph
           | otherwise = toBuildPlan cycle_mod_graph []
 
         toBuildPlan :: [SCC ModuleGraphNode] -> [ModuleGraphNode] -> [BuildPlan]
@@ -598,14 +601,17 @@ createBuildPlan mod_graph maybe_top_mod =
         collapseAcyclic [] = []
 
         topSortWithBoot nodes = topSortModules False (select_boot_modules nodes ++ nodes) Nothing
-
-
   in
-
-    assertPpr (sum (map countMods build_plan) == lengthMG mod_graph)
-              (vcat [text "Build plan missing nodes:", (text "PLAN:" <+> ppr (sum (map countMods build_plan))), (text "GRAPH:" <+> ppr (lengthMG mod_graph))])
+    -- We need to use 'acyclic_mod_graph', since if 'maybe_top_mod' is 'Just', then the resulting module
+    -- graph is pruned, reducing the number of 'build_plan' elements.
+    -- We don't use the size of 'cycle_mod_graph', as it removes @.hi-boot@ modules. These are added
+    -- later in the processing.
+    assertPpr (sum (map countMods build_plan) == lengthMGWithSCC acyclic_mod_graph)
+              (vcat [text "Build plan missing nodes:", (text "PLAN:" <+> ppr (sum (map countMods build_plan))), (text "GRAPH:" <+> ppr (lengthMGWithSCC acyclic_mod_graph))])
               build_plan
-
+  where
+    lengthMGWithSCC :: [SCC a] -> Int
+    lengthMGWithSCC = List.foldl' (\acc scc -> length scc + acc) 0
 
 -- | Generalized version of 'load' which also supports a custom
 -- 'Messager' (for reporting progress) and 'ModuleGraph' (generally
@@ -616,7 +622,7 @@ load' mhmi_cache how_much diag_wrapper mHscMessage mod_graph = do
     -- for any client who might interact with GHC via load'.
     -- See Note [Timing of plugin initialization]
     initializeSessionPlugins
-    modifySession $ \hsc_env -> hsc_env { hsc_mod_graph = mod_graph }
+    modifySession (setModuleGraph mod_graph)
     guessOutputFile
     hsc_env <- getSession
 
@@ -640,16 +646,20 @@ load' mhmi_cache how_much diag_wrapper mHscMessage mod_graph = do
 
     -- check that the module given in HowMuch actually exists, otherwise
     -- topSortModuleGraph will bomb later.
-    let checkHowMuch (LoadUpTo m)           = checkMod m
-        checkHowMuch (LoadDependenciesOf m) = checkMod m
+    let checkHowMuch (LoadUpTo ms)          = checkMods ms
+        checkHowMuch (LoadDependenciesOf m) = checkMods [m]
         checkHowMuch _ = id
 
-        checkMod m and_then
-            | m `Set.member` all_home_mods = and_then
-            | otherwise = do
-                    throwOneError $ mkPlainErrorMsgEnvelope noSrcSpan
-                                  $ GhcDriverMessage
-                                  $ DriverModuleNotFound (moduleUnit m) (moduleName m)
+        checkMods ms and_then =
+          case List.partition (`Set.member` all_home_mods) ms of
+            (_, []) -> and_then
+            (_, not_found_mods) -> do
+              let
+                mkModuleNotFoundError m =
+                  mkPlainErrorMsgEnvelope noSrcSpan
+                  $ GhcDriverMessage
+                  $ DriverModuleNotFound (moduleUnit m) (moduleName m)
+              throwErrors $ mkMessages $ listToBag [mkModuleNotFoundError not_found | not_found <- not_found_mods]
 
     checkHowMuch how_much $ do
 
@@ -662,12 +672,12 @@ load' mhmi_cache how_much diag_wrapper mHscMessage mod_graph = do
     -- are definitely unnecessary, then emit a warning.
     warnUnnecessarySourceImports (filterToposortToModules mg2_with_srcimps)
 
-    let maybe_top_mod = case how_much of
+    let maybe_top_mods = case how_much of
                           LoadUpTo m           -> Just m
-                          LoadDependenciesOf m -> Just m
+                          LoadDependenciesOf m -> Just [m]
                           _                    -> Nothing
 
-        build_plan = createBuildPlan mod_graph maybe_top_mod
+        build_plan = createBuildPlan mod_graph maybe_top_mods
 
 
     cache <- liftIO $ maybe (return []) iface_clearCache mhmi_cache
@@ -1194,7 +1204,6 @@ upsweep n_jobs hsc_env hmi_cache diag_wrapper mHscMessage old_hpt build_plan = d
 toCache :: [HomeModInfo] -> M.Map (ModNodeKeyWithUid) HomeModInfo
 toCache hmis = M.fromList ([(miKey $ hm_iface hmi, hmi) | hmi <- hmis])
 
-
 upsweep_inst :: HscEnv
              -> Maybe Messager
              -> Int  -- index of module
@@ -1246,70 +1255,6 @@ addSptEntries hsc_env mlinkable =
      , spt <- bc_spt_entries bco
      ]
 
-{- Note [-fno-code mode]
-~~~~~~~~~~~~~~~~~~~~~~~~
-GHC offers the flag -fno-code for the purpose of parsing and typechecking a
-program without generating object files. This is intended to be used by tooling
-and IDEs to provide quick feedback on any parser or type errors as cheaply as
-possible.
-
-When GHC is invoked with -fno-code no object files or linked output will be
-generated. As many errors and warnings as possible will be generated, as if
--fno-code had not been passed. The session DynFlags will have
-backend == NoBackend.
-
--fwrite-interface
-~~~~~~~~~~~~~~~~
-Whether interface files are generated in -fno-code mode is controlled by the
--fwrite-interface flag. The -fwrite-interface flag is a no-op if -fno-code is
-not also passed. Recompilation avoidance requires interface files, so passing
--fno-code without -fwrite-interface should be avoided. If -fno-code were
-re-implemented today, -fwrite-interface would be discarded and it would be
-considered always on; this behaviour is as it is for backwards compatibility.
-
-================================================================
-IN SUMMARY: ALWAYS PASS -fno-code AND -fwrite-interface TOGETHER
-================================================================
-
-Template Haskell
-~~~~~~~~~~~~~~~~
-A module using template haskell may invoke an imported function from inside a
-splice. This will cause the type-checker to attempt to execute that code, which
-would fail if no object files had been generated. See #8025. To rectify this,
-during the downsweep we patch the DynFlags in the ModSummary of any home module
-that is imported by a module that uses template haskell, to generate object
-code.
-
-The flavour of the generated code depends on whether `-fprefer-byte-code` is enabled
-or not in the module which needs the code generation. If the module requires byte-code then
-dependencies will generate byte-code, otherwise they will generate object files.
-In the case where some modules require byte-code and some object files, both are
-generated by enabling `-fbyte-code-and-object-code`, the test "fat015" tests these
-configurations.
-
-The object files (and interface files if -fwrite-interface is disabled) produced
-for template haskell are written to temporary files.
-
-Note that since template haskell can run arbitrary IO actions, -fno-code mode
-is no more secure than running without it.
-
-Potential TODOS:
-~~~~~
-* Remove -fwrite-interface and have interface files always written in -fno-code
-  mode
-* Both .o and .dyn_o files are generated for template haskell, but we only need
-  .dyn_o. Fix it.
-* In make mode, a message like
-  Compiling A (A.hs, /tmp/ghc_123.o)
-  is shown if downsweep enabled object code generation for A. Perhaps we should
-  show "nothing" or "temporary object file" instead. Note that one
-  can currently use -keep-tmp-files and inspect the generated file with the
-  current behaviour.
-* Offer a -no-codedir command line option, and write what were temporary
-  object files there. This would speed up recompilation.
-* Use existing object files (if they are up to date) instead of always
-  generating temporary ones.
--}
 
 -- Note [When source is considered modified]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1366,7 +1311,7 @@ topSortModuleGraph
           :: Bool
           -- ^ Drop hi-boot nodes? (see below)
           -> ModuleGraph
-          -> Maybe HomeUnitModule
+          -> Maybe [HomeUnitModule]
              -- ^ Root module name.  If @Nothing@, use the full graph.
           -> [SCC ModuleGraphNode]
 -- ^ Calculate SCCs of the module graph, possibly dropping the hi-boot nodes
@@ -1416,7 +1361,7 @@ topSortModuleGraph drop_hs_boot_nodes module_graph mb_root_mod =
     cmpModuleGraphNodes k1 k2 = compare (moduleGraphNodeRank k1) (moduleGraphNodeRank k2)
                                   `mappend` compare k2 k1
 
-topSortModules :: Bool -> [ModuleGraphNode] -> Maybe HomeUnitModule -> [SCC ModuleGraphNode]
+topSortModules :: Bool -> [ModuleGraphNode] -> Maybe [HomeUnitModule] -> [SCC ModuleGraphNode]
 topSortModules drop_hs_boot_nodes summaries mb_root_mod
   = map (fmap summaryNodeSummary) $ stronglyConnCompG initial_graph
   where
@@ -1425,17 +1370,20 @@ topSortModules drop_hs_boot_nodes summaries mb_root_mod
 
     initial_graph = case mb_root_mod of
         Nothing -> graph
-        Just (Module uid root_mod) ->
+        Just mods ->
             -- restrict the graph to just those modules reachable from
             -- the specified module.  We do this by building a graph with
             -- the full set of nodes, and determining the reachable set from
             -- the specified node.
-            let root | Just node <- lookup_node $ NodeKey_Module $ ModNodeKeyWithUid (GWIB root_mod NotBoot) uid
-                     , graph `hasVertexG` node
-                     = node
-                     | otherwise
-                     = throwGhcException (ProgramError "module does not exist")
-            in graphFromEdgedVerticesUniq (seq root (root:allReachable (graphReachability graph) root))
+            let
+              findNodeForModule (Module uid root_mod)
+                | Just node <- lookup_node $ NodeKey_Module $ ModNodeKeyWithUid (GWIB root_mod NotBoot) uid
+                , graph `hasVertexG` node
+                = seq node node
+                | otherwise
+                = throwGhcException (ProgramError "module does not exist")
+              roots = fmap findNodeForModule mods
+            in graphFromEdgedVerticesUniq (seq roots (roots ++ allReachableMany (graphReachability graph) roots))
 
 newtype ModNodeMap a = ModNodeMap { unModNodeMap :: Map.Map ModNodeKey a }
   deriving (Functor, Traversable, Foldable)

@@ -33,6 +33,7 @@ module GHC.Tc.Gen.HsType (
 
         bindOuterFamEqnTKBndrs_Q_Tv, bindOuterFamEqnTKBndrs,
         tcOuterTKBndrs, scopedSortOuter, outerTyVars, outerTyVarBndrs,
+        tcGadtConTyVarBndrs,
         bindOuterSigTKBndrs_Tv,
         tcExplicitTKBndrs,
         bindNamedWildCardBinders,
@@ -394,7 +395,7 @@ kcClassSigType :: [LocatedN Name] -> LHsSigType GhcRn -> TcM ()
 --     meth :: forall a (x :: f a). Proxy x -> ()
 -- When instantiating Proxy with kappa, we must unify kappa := f a. But we're
 -- still working out the kind of f, and thus f a will have a coercion in it.
--- Coercions may block unification (Note [Equalities with incompatible kinds] in
+-- Coercions may block unification (Note [Equalities with heterogeneous kinds] in
 -- GHC.Tc.Solver.Equality, wrinkle (EIK2)) and so we fail to unify. If we try to
 -- kind-generalize, we'll end up promoting kappa to the top level (because
 -- kind-generalization is normally done right before adding a binding to the context),
@@ -3368,6 +3369,20 @@ tcOuterTKBndrsX skol_mode skol_info outer_bndrs thing_inside
            ; return ( HsOuterExplicit { hso_xexplicit = exp_tvs'
                                       , hso_bndrs     = exp_bndrs }
                     , thing) }
+
+---------------
+tcGadtConTyVarBndrs :: SkolemInfo
+                    -> HsOuterSigTyVarBndrs GhcRn
+                    -> [HsForAllTelescope GhcRn]
+                    -> TcM a -> TcM ([TcTyVarBinder], a)
+tcGadtConTyVarBndrs skol_info outer inner thing_inside
+  = do { (outer_bndrs, (inner_tvbs, a)) <-
+            tcOuterTKBndrs skol_info outer $
+            tcExplicitTKBndrs skol_info (concatMap hsForAllTelescopeBndrs inner) $
+            thing_inside
+       ; outer_bndrs <- scopedSortOuter outer_bndrs
+       ; let outer_tvbs = tyVarSpecToBinders (outerTyVarBndrs outer_bndrs)
+       ; return (outer_tvbs ++ inner_tvbs, a) }
 
 --------------------------------------
 --    Explicit tyvar binders

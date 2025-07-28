@@ -34,13 +34,15 @@ module GHC.Unit.Home.Graph
   , lookupHug
   , lookupHugByModule
   , lookupHugUnit
-
+  , lookupHugUnitId
+  , lookupAllHug
+  , memberHugUnit
+  , memberHugUnitId
   -- ** Reachability
   , transitiveHomeDeps
 
   -- * Very important queries
   , allInstances
-  , allFamInstances
   , allAnns
   , allCompleteSigs
 
@@ -62,6 +64,8 @@ module GHC.Unit.Home.Graph
   , unitEnv_insert
   , unitEnv_new
   , unitEnv_lookup
+  , unitEnv_traverseWithKey
+  , unitEnv_assocs
   ) where
 
 import GHC.Prelude
@@ -73,6 +77,7 @@ import GHC.Unit.Home.PackageTable
 import GHC.Unit.Module
 import GHC.Unit.Module.ModIface
 import GHC.Unit.State
+import GHC.Utils.Monad (mapMaybeM)
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 
@@ -103,10 +108,6 @@ allInstances :: HomeUnitGraph -> IO (InstEnv, [FamInst])
 allInstances hug = foldr go (pure (emptyInstEnv, [])) hug where
   go hue = liftA2 (\(a,b) (a',b') -> (a `unionInstEnv` a', b ++ b'))
                   (hptAllInstances (homeUnitEnv_hpt hue))
-
-allFamInstances :: HomeUnitGraph -> IO (ModuleEnv FamInstEnv)
-allFamInstances hug = foldr go (pure emptyModuleEnv) hug where
-  go hue = liftA2 plusModuleEnv (hptAllFamInstances (homeUnitEnv_hpt hue))
 
 allAnns :: HomeUnitGraph -> IO AnnEnv
 allAnns hug = foldr go (pure emptyAnnEnv) hug where
@@ -222,7 +223,7 @@ updateUnitFlags uid f = unitEnv_adjust update uid
 -- | Compute the transitive closure of a unit in the 'HomeUnitGraph'.
 -- If the argument unit is not present in the graph returns Nothing.
 transitiveHomeDeps :: UnitId -> HomeUnitGraph -> Maybe [UnitId]
-transitiveHomeDeps uid hug = case lookupHugUnit uid hug of
+transitiveHomeDeps uid hug = case lookupHugUnitId uid hug of
   Nothing -> Nothing
   Just hue -> Just $
     Set.toList (loop (Set.singleton uid) (homeUnitDepends (homeUnitEnv_units hue)))
@@ -234,7 +235,7 @@ transitiveHomeDeps uid hug = case lookupHugUnit uid hug of
           let hue = homeUnitDepends
                     . homeUnitEnv_units
                     . expectJust
-                    $ lookupHugUnit uid hug
+                    $ lookupHugUnitId uid hug
           in loop (Set.insert uid acc) (hue ++ uids)
 
 --------------------------------------------------------------------------------
@@ -246,21 +247,47 @@ transitiveHomeDeps uid hug = case lookupHugUnit uid hug of
 lookupHug :: HomeUnitGraph -> UnitId -> ModuleName -> IO (Maybe HomeModInfo)
 lookupHug hug uid mod = do
   case unitEnv_lookup_maybe uid hug of
-    -- Really, here we want "lookup HPT" rather than unitEnvLookup
     Nothing -> pure Nothing
     Just hue -> lookupHpt (homeUnitEnv_hpt hue) mod
 
 -- | Lookup the 'HomeModInfo' of a 'Module' in the 'HomeUnitGraph' (via the 'HomePackageTable' of the corresponding unit)
 lookupHugByModule :: Module -> HomeUnitGraph -> IO (Maybe HomeModInfo)
-lookupHugByModule mod hug
-  | otherwise = do
-      case unitEnv_lookup_maybe (toUnitId $ moduleUnit mod) hug of
-        Nothing -> pure Nothing
-        Just env -> lookupHptByModule (homeUnitEnv_hpt env) mod
+lookupHugByModule mod hug =
+  case lookupHugUnit (moduleUnit mod) hug of
+    Nothing -> pure Nothing
+    Just env -> lookupHptByModule (homeUnitEnv_hpt env) mod
+
+-- | Lookup all 'HomeModInfo' that have the same 'ModuleName' as the given 'ModuleName'.
+-- 'ModuleName's are not unique in the case of multiple home units, so there can be
+-- more than one possible 'HomeModInfo'.
+--
+-- You should always prefer 'lookupHug' and 'lookupHugByModule' when possible.
+lookupAllHug :: HomeUnitGraph -> ModuleName -> IO [HomeModInfo]
+lookupAllHug hug mod = mapMaybeM (\uid -> lookupHug hug uid mod) (Set.toList $ unitEnv_keys hug)
 
 -- | Lookup a 'HomeUnitEnv' by 'UnitId' in a 'HomeUnitGraph'
-lookupHugUnit :: UnitId -> HomeUnitGraph -> Maybe HomeUnitEnv
-lookupHugUnit = unitEnv_lookup_maybe
+lookupHugUnitId :: UnitId -> HomeUnitGraph -> Maybe HomeUnitEnv
+lookupHugUnitId = unitEnv_lookup_maybe
+
+-- | Check whether the 'UnitId' is present in the 'HomeUnitGraph'
+memberHugUnitId :: UnitId -> HomeUnitGraph -> Bool
+memberHugUnitId u = isJust . lookupHugUnitId u
+
+-- | Lookup up the 'HomeUnitEnv' by the 'Unit' in the 'HomeUnitGraph'.
+-- If the 'Unit' can be turned into a 'UnitId', we behave identical to 'lookupHugUnitId'.
+--
+-- A 'HoleUnit' is never part of the 'HomeUnitGraph', only instantiated 'Unit's
+lookupHugUnit :: Unit -> HomeUnitGraph -> Maybe HomeUnitEnv
+lookupHugUnit unit hug =
+  if isHoleUnit unit
+    then Nothing
+    else lookupHugUnitId (toUnitId unit) hug
+
+-- | Check whether the 'Unit' is present in the 'HomeUnitGraph'
+--
+-- A 'HoleUnit' is never part of the 'HomeUnitGraph', only instantiated 'Unit's
+memberHugUnit :: Unit -> HomeUnitGraph -> Bool
+memberHugUnit u = isJust . lookupHugUnit u
 
 --------------------------------------------------------------------------------
 -- * Internal representation map
@@ -312,6 +339,13 @@ unitEnv_foldWithKey f z (UnitEnvGraph g)= Map.foldlWithKey' f z g
 
 unitEnv_lookup :: UnitEnvGraphKey -> UnitEnvGraph v -> v
 unitEnv_lookup u env = expectJust $ unitEnv_lookup_maybe u env
+
+unitEnv_traverseWithKey :: Applicative f => (UnitEnvGraphKey -> a -> f b) -> UnitEnvGraph a -> f (UnitEnvGraph b)
+unitEnv_traverseWithKey f unitEnv =
+  UnitEnvGraph <$> Map.traverseWithKey f (unitEnv_graph unitEnv)
+
+unitEnv_assocs :: UnitEnvGraph a -> [(UnitEnvGraphKey, a)]
+unitEnv_assocs (UnitEnvGraph x) = Map.assocs x
 
 --------------------------------------------------------------------------------
 -- * Utilities

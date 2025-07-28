@@ -43,7 +43,7 @@ import GHC.Types.Name             ( Name, nameSrcSpan, nameUnique, wiredInNameTy
 import GHC.Types.Name.Env         ( NameEnv, emptyNameEnv, extendNameEnv, lookupNameEnv )
 import GHC.Types.Name.Reader      ( RecFieldInfo(..), WithUserRdr(..) )
 import GHC.Types.SrcLoc
-import GHC.Core.Type              ( Type )
+import GHC.Core.Type              ( Type, ForAllTyFlag(..) )
 import GHC.Core.TyCon             ( TyCon, tyConClass_maybe )
 import GHC.Core.Predicate
 import GHC.Core.InstEnv
@@ -817,6 +817,7 @@ class ( HiePass (NoGhcTcPass p)
       , Data (HsCmdTop (GhcPass p))
       , Data (GRHS (GhcPass p) (LocatedA (HsCmd (GhcPass p))))
       , Data (HsUntypedSplice (GhcPass p))
+      , Data (HsTypedSplice (GhcPass p))
       , Data (HsLocalBinds (GhcPass p))
       , Data (FieldOcc (GhcPass p))
       , Data (HsTupArg (GhcPass p))
@@ -826,6 +827,7 @@ class ( HiePass (NoGhcTcPass p)
       , Anno (IdGhcP p) ~ SrcSpanAnnN
       , Anno (IdOccGhcP p) ~ SrcSpanAnnN
       , Typeable p
+      , IsPass p
       )
       => HiePass p where
   hiePass :: HiePassEv p
@@ -1332,7 +1334,7 @@ instance HiePass p => ToHie (LocatedA (HsExpr (GhcPass p))) where
           , toHie p
           ]
       HsTypedSplice _ x ->
-        [ toHie x
+        [ toHie $ L mspan x
         ]
       HsUntypedSplice _ x ->
         [ toHie $ L mspan x
@@ -1736,16 +1738,18 @@ instance ToHie (LocatedP OverlapMode) where
 
 instance ToHie (LocatedA (ConDecl GhcRn)) where
   toHie (L span decl) = concatM $ makeNode decl (locA span) : case decl of
-      ConDeclGADT { con_names = names, con_bndrs = L outer_bndrs_loc outer_bndrs
-                  , con_mb_cxt = ctx, con_g_args = args, con_res_ty = typ
+      ConDeclGADT { con_names = names
+                  , con_outer_bndrs = L outer_bndrs_loc outer_bndrs
+                  , con_inner_bndrs = inner_bndrs
+                  , con_mb_cxt = ctx
+                  , con_g_args = args
+                  , con_res_ty = typ
                   , con_doc = doc} ->
         [ toHie $ C (Decl ConDec $ getRealSpanA span) <$> names
-        , case outer_bndrs of
-            HsOuterImplicit{hso_ximplicit = imp_vars} ->
-              bindingsOnly $ map (C $ TyVarBind (mkScope outer_bndrs_loc) resScope)
-                             imp_vars
-            HsOuterExplicit{hso_bndrs = exp_bndrs} ->
-              toHie $ tvScopes resScope NoScope exp_bndrs
+        , bindingsOnly $  -- implicit forall
+            map (C $ TyVarBind (mkScope outer_bndrs_loc) (ResolvedScopes [sigmaScope]))
+                imp_vars
+        , toHie $ tvScopes (ResolvedScopes [phiScope]) NoScope exp_bndrs
         , toHie ctx
         , toHie args
         , toHie typ
@@ -1758,7 +1762,14 @@ instance ToHie (LocatedA (ConDecl GhcRn)) where
             PrefixConGADT _ xs -> scaled_args_scope xs
             RecConGADT _ x     -> mkScope x
           tyScope = mkScope typ
-          resScope = ResolvedScopes [ctxScope, rhsScope]
+          phiScope = combineScopes ctxScope rhsScope
+          sigmaScope = foldr combineScopes phiScope (map (mkScope . getLoc) exp_bndrs)
+          imp_vars = case outer_bndrs of
+            HsOuterImplicit{hso_ximplicit = imp_vars} -> imp_vars
+            HsOuterExplicit{} -> []
+          exp_bndrs =
+            [ L l (updateHsTyVarBndrFlag Invisible b) | L l b <- hsOuterExplicitBndrs outer_bndrs ]
+            ++ concatMap hsForAllTelescopeBndrs inner_bndrs
       ConDeclH98 { con_name = name, con_ex_tvs = qvars
                  , con_mb_cxt = ctx, con_args = dets
                  , con_doc = doc} ->
@@ -2025,11 +2036,19 @@ instance ToHie (HsQuote GhcRn) where
   toHie (TypBr _ ty) = toHie ty
   toHie (VarBr {} )  = pure []
 
-instance ToHie PendingRnSplice where
-  toHie (PendingRnSplice _ _ e) = toHie e
+instance forall pass . HiePass pass => ToHie (HsUntypedSplice (GhcPass pass)) where
+  toHie (HsUntypedSpliceExpr _ext e) = toHie e
+  toHie (HsQuasiQuote _ext quoter _ispanFs) = toHie (C Use quoter)
+  toHie (XUntypedSplice ext) =
+    case ghcPass @pass of
+      GhcRn -> case ext of
+        HsImplicitLiftSplice _ _ _ lid -> toHie (C Use lid)
 
 instance ToHie PendingTcSplice where
   toHie (PendingTcSplice _ e) = toHie e
+
+instance ToHie PendingRnSplice where
+  toHie (PendingRnSplice _ e) = toHie e
 
 instance (HiePass p, Data (IdGhcP p))
   => ToHie (GenLocated SrcSpanAnnL (BooleanFormula (GhcPass p))) where
@@ -2050,7 +2069,7 @@ instance (HiePass p, Data (IdGhcP p))
 instance ToHie (LocatedAn NoEpAnns HsIPName) where
   toHie (L span e) = makeNodeA e span
 
-instance HiePass p => ToHie (LocatedA (HsUntypedSplice (GhcPass p))) where
+instance (HiePass p) => ToHie (LocatedA (HsUntypedSplice (GhcPass p))) where
   toHie (L span sp) = concatM $ makeNodeA sp span : case sp of
       HsUntypedSpliceExpr _ expr ->
         [ toHie expr
@@ -2058,6 +2077,27 @@ instance HiePass p => ToHie (LocatedA (HsUntypedSplice (GhcPass p))) where
       HsQuasiQuote _ _ ispanFs ->
         [ locOnly (getLocA ispanFs)
         ]
+      XUntypedSplice x ->
+        case ghcPass @p of
+          GhcRn -> case x of
+            HsImplicitLiftSplice _ _ _ lid ->
+              [ toHie $ C Use lid
+              ]
+
+instance HiePass p => ToHie (LocatedA (HsTypedSplice (GhcPass p))) where
+  toHie (L span sp) =  concatM $ makeNodeA sp span : case sp of
+      HsTypedSpliceExpr _ expr ->
+        [ toHie expr
+        ]
+      XTypedSplice x ->
+        case ghcPass @p of
+          GhcRn -> case x of
+            HsImplicitLiftSplice _ _ _ lid ->
+              [ toHie $ C Use lid
+              ]
+
+
+
 
 instance ToHie (LocatedA (RoleAnnotDecl GhcRn)) where
   toHie (L span annot) = concatM $ makeNodeA annot span : case annot of
@@ -2268,6 +2308,9 @@ instance ToHie (IEContext (LocatedA (IEWrappedName GhcRn))) where
         [ toHie $ C (IEThing c) (L l p)
         ]
       IEType _ (L l n) ->
+        [ toHie $ C (IEThing c) (L l n)
+        ]
+      IEData _ (L l n) ->
         [ toHie $ C (IEThing c) (L l n)
         ]
 

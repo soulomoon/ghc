@@ -71,6 +71,8 @@ test('divbyzero',
       # Apparently the output can be different on different
       # Linux setups, so just ignore it. As long as we get
       # the right exit code we're OK.
+      when(arch('loongarch64'), skip),
+      # LoongArch64 has no exception for this, too.
       when(opsys('linux'), ignore_stderr),
       # On OpenBSD the output varies depending on ulimit, exit code is enough.
       when(opsys('openbsd'), ignore_stderr),
@@ -639,3 +641,10 @@ test('T25280', [unless(opsys('linux'),skip),req_process,js_skip], compile_and_ru
 # N.B. This will likely issue a warning on stderr but we merely care that the
 # program doesn't crash.
 test('T25560', [req_c_rts, ignore_stderr], compile_and_run, [''])
+
+test('TestProddableBlockSet', [req_c_rts], multimod_compile_and_run, ['TestProddableBlockSet.c', '-no-hs-main'])
+test('T22859', 
+     [js_skip,
+      # Allocation behaviour differs with the wasm backend so we get different output
+      when(arch('wasm32'), skip)],
+     compile_and_run, ['-with-rtsopts -A8K'])

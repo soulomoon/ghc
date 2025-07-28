@@ -3,6 +3,7 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings     #-}
 {-# LANGUAGE DataKinds             #-}
+{-# LANGUAGE RecordWildCards       #-}
 {-# OPTIONS_GHC -optc-DNON_POSIX_SOURCE #-}
 --
 --  (c) The University of Glasgow 2002-2006
@@ -27,9 +28,11 @@ import GHCi.ResolvedBCO
 import GHC.Builtin.PrimOps
 import GHC.Builtin.PrimOps.Ids
 
+import GHC.Unit.Module.Env
 import GHC.Unit.Types
 
 import GHC.Data.FastString
+import GHC.Data.Maybe
 import GHC.Data.SizedSeq
 
 import GHC.Linker.Types
@@ -55,24 +58,27 @@ linkBCO
   :: Interp
   -> PkgsLoaded
   -> LinkerEnv
+  -> LinkedBreaks
   -> NameEnv Int
   -> UnlinkedBCO
   -> IO ResolvedBCO
-linkBCO interp pkgs_loaded le bco_ix
+linkBCO interp pkgs_loaded le lb bco_ix
            (UnlinkedBCO _ arity insns bitmap lits0 ptrs0) = do
   -- fromIntegral Word -> Word64 should be a no op if Word is Word64
   -- otherwise it will result in a cast to longlong on 32bit systems.
-  (lits :: [Word]) <- mapM (fmap fromIntegral . lookupLiteral interp pkgs_loaded le) (elemsFlatBag lits0)
-  ptrs <- mapM (resolvePtr interp pkgs_loaded le bco_ix) (elemsFlatBag ptrs0)
+  (lits :: [Word]) <- mapM (fmap fromIntegral . lookupLiteral interp pkgs_loaded le lb) (elemsFlatBag lits0)
+  ptrs <- mapM (resolvePtr interp pkgs_loaded le lb bco_ix) (elemsFlatBag ptrs0)
   let lits' = listArray (0 :: Int, fromIntegral (sizeFlatBag lits0)-1) lits
-  return (ResolvedBCO isLittleEndian arity
-              insns
-              bitmap
-              (mkBCOByteArray lits')
-              (addListToSS emptySS ptrs))
+  return $ ResolvedBCO { resolvedBCOIsLE   = isLittleEndian
+                       , resolvedBCOArity  = arity
+                       , resolvedBCOInstrs = insns
+                       , resolvedBCOBitmap = bitmap
+                       , resolvedBCOLits   = mkBCOByteArray lits'
+                       , resolvedBCOPtrs   = addListToSS emptySS ptrs
+                       }
 
-lookupLiteral :: Interp -> PkgsLoaded -> LinkerEnv -> BCONPtr -> IO Word
-lookupLiteral interp pkgs_loaded le ptr = case ptr of
+lookupLiteral :: Interp -> PkgsLoaded -> LinkerEnv -> LinkedBreaks -> BCONPtr -> IO Word
+lookupLiteral interp pkgs_loaded le lb ptr = case ptr of
   BCONPtrWord lit -> return lit
   BCONPtrLbl  sym -> do
     Ptr a# <- lookupStaticPtr interp sym
@@ -83,9 +89,22 @@ lookupLiteral interp pkgs_loaded le ptr = case ptr of
   BCONPtrAddr nm -> do
     Ptr a# <- lookupAddr interp pkgs_loaded (addr_env le) nm
     return (W# (int2Word# (addr2Int# a#)))
-  BCONPtrStr _ ->
-    -- should be eliminated during assembleBCOs
-    panic "lookupLiteral: BCONPtrStr"
+  BCONPtrStr bs -> do
+    RemotePtr p <- fmap head $ interpCmd interp $ MallocStrings [bs]
+    pure $ fromIntegral p
+  BCONPtrFS fs -> do
+    RemotePtr p <- fmap head $ interpCmd interp $ MallocStrings [bytesFS fs]
+    pure $ fromIntegral p
+  BCONPtrFFIInfo (FFIInfo {..}) -> do
+    RemotePtr p <- interpCmd interp $ PrepFFI ffiInfoArgs ffiInfoRet
+    pure $ fromIntegral p
+  BCONPtrCostCentre BreakpointId{..}
+    | interpreterProfiled interp -> do
+        case expectJust (lookupModuleEnv (ccs_env lb) bi_tick_mod) ! bi_tick_index of
+          RemotePtr p -> pure $ fromIntegral p
+    | otherwise ->
+        case toRemotePtr nullPtr of
+          RemotePtr p -> pure $ fromIntegral p
 
 lookupStaticPtr :: Interp -> FastString -> IO (Ptr ())
 lookupStaticPtr interp addr_of_label_string = do
@@ -140,10 +159,11 @@ resolvePtr
   :: Interp
   -> PkgsLoaded
   -> LinkerEnv
+  -> LinkedBreaks
   -> NameEnv Int
   -> BCOPtr
   -> IO ResolvedBCOPtr
-resolvePtr interp pkgs_loaded le bco_ix ptr = case ptr of
+resolvePtr interp pkgs_loaded le lb bco_ix ptr = case ptr of
   BCOPtrName nm
     | Just ix <- lookupNameEnv bco_ix nm
     -> return (ResolvedBCORef ix) -- ref to another BCO in this group
@@ -164,10 +184,11 @@ resolvePtr interp pkgs_loaded le bco_ix ptr = case ptr of
     -> ResolvedBCOStaticPtr <$> lookupPrimOp interp pkgs_loaded op
 
   BCOPtrBCO bco
-    -> ResolvedBCOPtrBCO <$> linkBCO interp pkgs_loaded le bco_ix bco
+    -> ResolvedBCOPtrBCO <$> linkBCO interp pkgs_loaded le lb bco_ix bco
 
-  BCOPtrBreakArray breakarray
-    -> withForeignRef breakarray $ \ba -> return (ResolvedBCOPtrBreakArray ba)
+  BCOPtrBreakArray tick_mod ->
+    withForeignRef (expectJust (lookupModuleEnv (breakarray_env lb) tick_mod)) $
+      \ba -> pure $ ResolvedBCOPtrBreakArray ba
 
 -- | Look up the address of a Haskell symbol in the currently
 -- loaded units.

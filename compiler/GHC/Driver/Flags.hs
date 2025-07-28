@@ -259,6 +259,8 @@ extensionName = \case
   LangExt.ExtendedLiterals -> "ExtendedLiterals"
   LangExt.ListTuplePuns -> "ListTuplePuns"
   LangExt.MultilineStrings -> "MultilineStrings"
+  LangExt.ExplicitLevelImports -> "ExplicitLevelImports"
+  LangExt.ImplicitStagePersistence -> "ImplicitStagePersistence"
 
 -- | Is this extension known by any other names? For example
 -- -XGeneralizedNewtypeDeriving is accepted
@@ -352,6 +354,8 @@ impliedXFlags
 
     -- See (NVP3) in Note [Non-variable pattern bindings aren't linear] in GHC.Tc.Gen.Bind
     , (LangExt.LinearTypes, On LangExt.MonoLocalBinds)
+
+    , (LangExt.ExplicitLevelImports, Off LangExt.ImplicitStagePersistence)
   ]
 
 
@@ -754,6 +758,9 @@ data GeneralFlag
    | Opt_GhciBrowser
    | Opt_GhciBrowserRedirectWasiConsole
 
+   -- | Instruct GHCi to load all targets on startup
+   | Opt_GhciDoLoadTargets
+
    | Opt_HelpfulErrors
    | Opt_DeferTypeErrors             -- Since 7.6
    | Opt_DeferTypedHoles             -- Since 7.10
@@ -1087,7 +1094,7 @@ data WarningFlag =
    | Opt_WarnImplicitRhsQuantification               -- ^ @since 9.8
    | Opt_WarnIncompleteExportWarnings                -- ^ @since 9.8
    | Opt_WarnIncompleteRecordSelectors               -- ^ @since 9.10
-   | Opt_WarnBadlyStagedTypes                        -- ^ @since 9.10
+   | Opt_WarnBadlyLevelledTypes                      -- ^ @since 9.10
    | Opt_WarnInconsistentFlags                       -- ^ @since 9.8
    | Opt_WarnDataKindsTC                             -- ^ @since 9.10
    | Opt_WarnDefaultedExceptionContext               -- ^ @since 9.10
@@ -1098,6 +1105,8 @@ data WarningFlag =
        -- ^ @since 9.14, scheduled to be removed in 9.18
        --
        -- See Note [Quantifying over equalities in RULES] in GHC.Tc.Gen.Sig
+   | Opt_WarnUnusableUnpackPragmas                   -- Since 9.14
+   | Opt_WarnPatternNamespaceSpecifier               -- Since 9.14
    deriving (Eq, Ord, Show, Enum, Bounded)
 
 -- | Return the names of a WarningFlag
@@ -1209,7 +1218,7 @@ warnFlagNames wflag = case wflag of
   Opt_WarnImplicitRhsQuantification               -> "implicit-rhs-quantification" :| []
   Opt_WarnIncompleteExportWarnings                -> "incomplete-export-warnings" :| []
   Opt_WarnIncompleteRecordSelectors               -> "incomplete-record-selectors" :| []
-  Opt_WarnBadlyStagedTypes                        -> "badly-staged-types" :| []
+  Opt_WarnBadlyLevelledTypes                      -> "badly-levelled-types" :| []
   Opt_WarnInconsistentFlags                       -> "inconsistent-flags" :| []
   Opt_WarnDataKindsTC                             -> "data-kinds-tc" :| []
   Opt_WarnDefaultedExceptionContext               -> "defaulted-exception-context" :| []
@@ -1217,6 +1226,8 @@ warnFlagNames wflag = case wflag of
   Opt_WarnUselessSpecialisations                  -> "useless-specialisations" :| ["useless-specializations"]
   Opt_WarnDeprecatedPragmas                       -> "deprecated-pragmas" :| []
   Opt_WarnRuleLhsEqualities                       -> "rule-lhs-equalities" :| []
+  Opt_WarnUnusableUnpackPragmas                   -> "unusable-unpack-pragmas" :| []
+  Opt_WarnPatternNamespaceSpecifier               -> "pattern-namespace-specifier" :| []
 
 -- -----------------------------------------------------------------------------
 -- Standard sets of warning options
@@ -1353,16 +1364,16 @@ standardWarnings -- see Note [Documenting warning flags]
         Opt_WarnOperatorWhitespaceExtConflict,
         Opt_WarnUnicodeBidirectionalFormatCharacters,
         Opt_WarnGADTMonoLocalBinds,
-        Opt_WarnBadlyStagedTypes,
+        Opt_WarnBadlyLevelledTypes,
         Opt_WarnTypeEqualityRequiresOperators,
         Opt_WarnInconsistentFlags,
-        Opt_WarnDataKindsTC,
         Opt_WarnTypeEqualityOutOfScope,
         Opt_WarnImplicitRhsQuantification, -- was in -Wcompat since 9.8, enabled by default since 9.14, to turn into a hard error in 9.16
         Opt_WarnViewPatternSignatures,
         Opt_WarnUselessSpecialisations,
         Opt_WarnDeprecatedPragmas,
-        Opt_WarnRuleLhsEqualities
+        Opt_WarnRuleLhsEqualities,
+        Opt_WarnUnusableUnpackPragmas
       ]
 
 -- | Things you get with @-W@.
@@ -1413,7 +1424,8 @@ minusWeverythingOpts = [ toEnum 0 .. ]
 -- code future compatible to fix issues before they even generate warnings.
 minusWcompatOpts :: [WarningFlag]
 minusWcompatOpts
-    = []
+    = [ Opt_WarnPatternNamespaceSpecifier
+      ]
 
 -- | Things you get with @-Wunused-binds@.
 unusedBindsFlags :: [WarningFlag]

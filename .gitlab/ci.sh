@@ -34,7 +34,11 @@ function time_it() {
   local delta=$(expr $end - $start)
 
   echo "$name took $delta seconds"
-  printf "%15s | $delta" > ci-timings
+  if [[ ! -e ci_timings.txt ]]; then
+    echo "=== TIMINGS ===" > ci_timings.txt
+  fi
+
+  printf "%15s | $delta\n" $name >> ci_timings.txt
   return $res
 }
 
@@ -220,6 +224,17 @@ function set_toolchain_paths() {
     *) fail "bad toolchain_source"
   esac
 
+  echo "Using toolchain source: $toolchain_source"
+  echo "Toolchain paths:"
+  echo "  CABAL: $(which cabal)"
+  echo "  GHC: $(which ghc)"
+  echo "  HAPPY: $(which happy)"
+  echo "  ALEX: $(which alex)"
+  echo "  OPT: $(which opt)"
+  echo "  LLC: $(which llc)"
+  echo "  LLVMAS: $LLVMAS"
+  echo "  clang: $(which clang)"
+
   export GHC
   export CABAL
   export HAPPY
@@ -239,8 +254,6 @@ function cabal_update() {
 
 # Extract GHC toolchain
 function setup() {
-  echo "=== TIMINGS ===" > ci-timings
-
   if [ -d "$CABAL_CACHE" ]; then
       info "Extracting cabal cache from $CABAL_CACHE to $CABAL_DIR..."
       mkdir -p "$CABAL_DIR"
@@ -279,7 +292,7 @@ function fetch_ghc() {
           fail "neither GHC nor GHC_VERSION are not set"
       fi
 
-      start_section "fetch GHC"
+      start_section fetch-ghc "Fetch GHC"
       url="https://downloads.haskell.org/~ghc/${GHC_VERSION}/ghc-${GHC_VERSION}-${boot_triple}.tar.xz"
       info "Fetching GHC binary distribution from $url..."
       curl "$url" > ghc.tar.xz || fail "failed to fetch GHC binary distribution"
@@ -296,7 +309,7 @@ function fetch_ghc() {
           ;;
       esac
       rm -Rf "ghc-${GHC_VERSION}" ghc.tar.xz
-      end_section "fetch GHC"
+      end_section fetch-ghc
   fi
 
 }
@@ -308,7 +321,7 @@ function fetch_cabal() {
           fail "neither CABAL nor CABAL_INSTALL_VERSION are not set"
       fi
 
-      start_section "fetch cabal"
+      start_section fetch-cabal "Fetch Cabal"
       case "$(uname)" in
         # N.B. Windows uses zip whereas all others use .tar.xz
         MSYS_*|MINGW*)
@@ -341,7 +354,7 @@ function fetch_cabal() {
           fi
           ;;
       esac
-      end_section "fetch cabal"
+      end_section fetch-cabal
   fi
 }
 
@@ -349,6 +362,7 @@ function fetch_cabal() {
 # here. For Docker platforms this is done in the Docker image
 # build.
 function setup_toolchain() {
+  start_section setup-toolchain "Setup toolchain"
   fetch_ghc
   fetch_cabal
   cabal_update
@@ -371,10 +385,11 @@ function setup_toolchain() {
 
   info "Building alex..."
   $cabal_install alex --constraint="alex>=$MIN_ALEX_VERSION"
+  end_section setup-toolchain
 }
 
 function cleanup_submodules() {
-  start_section "clean submodules"
+  start_section clean-submodules "Clean submodules"
   if [ -d .git ]; then
     info "Cleaning submodules..."
     # On Windows submodules can inexplicably get into funky states where git
@@ -386,7 +401,7 @@ function cleanup_submodules() {
   else
     info "Not cleaning submodules, not in a git repo"
   fi;
-  end_section "clean submodules"
+  end_section clean-submodules
 }
 
 function configure() {
@@ -486,6 +501,8 @@ function check_release_build() {
 }
 
 function build_hadrian() {
+  start_section build-hadrian "Build via Hadrian"
+
   if [ -z "${BIN_DIST_NAME:-}" ]; then
     fail "BIN_DIST_NAME not set"
   fi
@@ -519,7 +536,7 @@ function build_hadrian() {
           ;;
     esac
   fi
-
+  end_section build-hadrian
 }
 
 # run's `make DESTDIR=$1 install` and then
@@ -545,6 +562,7 @@ function make_install_destdir() {
 
 # install the binary distribution in directory $1 to $2.
 function install_bindist() {
+  start_section install-bindist "Install bindist"
   case "${CONFIGURE_WRAPPER:-}" in
     emconfigure) source "$EMSDK/emsdk_env.sh" ;;
     *) ;;
@@ -561,9 +579,17 @@ function install_bindist() {
     *)
       read -r -a args <<< "${INSTALL_CONFIGURE_ARGS:-}"
 
+      if [[ "${CROSS_TARGET:-no_cross_target}" =~ "mingw" ]]; then
+          # We suppose that host target = build target.
+          # By the fact above it is clearly turning out which host value is
+          # for currently built compiler.
+          # The fix for #21970 will probably remove this if-branch.
+          local -r CROSS_HOST_GUESS=$($SHELL ./config.guess)
+          args+=( "--target=$CROSS_TARGET" "--host=$CROSS_HOST_GUESS" )
+
       # FIXME: The bindist configure script shouldn't need to be reminded of
       # the target platform. See #21970.
-      if [ -n "${CROSS_TARGET:-}" ]; then
+      elif [ -n "${CROSS_TARGET:-}" ]; then
           args+=( "--target=$CROSS_TARGET" "--host=$CROSS_TARGET" )
       fi
 
@@ -572,13 +598,15 @@ function install_bindist() {
           "${args[@]+"${args[@]}"}" || fail "bindist configure failed"
       make_install_destdir "$TOP"/destdir "$instdir"
       # And check the `--info` of the installed compiler, sometimes useful in CI log.
-      "$instdir"/bin/ghc --info
+      "$instdir/bin/${cross_prefix}ghc$exe" --info
       ;;
   esac
   popd
+  end_section install-bindist
 }
 
 function test_hadrian() {
+  start_section test-hadrian "Test via Hadrian"
   check_msys2_deps _build/stage1/bin/ghc --version
   check_release_build
 
@@ -629,8 +657,23 @@ function test_hadrian() {
     install_bindist _build/bindist/ghc-*/ "$instdir"
     echo 'main = putStrLn "hello world"' > expected
     run "$test_compiler" -package ghc "$TOP/.gitlab/hello.hs" -o hello
-    ${CROSS_EMULATOR:-} ./hello > actual
-    run diff expected actual
+
+    if [[ "${CROSS_TARGET:-no_cross_target}" =~ "mingw" ]]; then
+      ${CROSS_EMULATOR:-} ./hello.exe > actual
+    else
+      ${CROSS_EMULATOR:-} ./hello > actual
+    fi
+
+    # We have to use `-w` to make the test more stable across supported
+    # platforms, i.e. Windows:
+    # $ cmp expected actual
+    # differ: byte 30, line 1
+    # $ diff expected actual
+    # 1c1
+    # < main = putStrLn "hello world"
+    # ---
+    # > main = putStrLn "hello world"
+    run diff -w expected actual
   elif [[ -n "${REINSTALL_GHC:-}" ]]; then
     run_hadrian \
       test \
@@ -685,6 +728,7 @@ function test_hadrian() {
     info "STAGE2_TEST=$?"
 
   fi
+  end_section test-hadrian
 }
 
 function summarise_hi_files() {
@@ -719,7 +763,7 @@ function cabal_abi_test() {
   pushd $DIR
   echo $PWD
 
-  start_section "Cabal test: $OUT"
+  start_section cabal-abi-test "Cabal ABI test: $OUT"
   mkdir -p "$OUT"
   "$HC" \
     -hidir tmp -odir tmp -fforce-recomp -haddock \
@@ -729,7 +773,7 @@ function cabal_abi_test() {
   summarise_hi_files
   summarise_o_files
   popd
-  end_section "Cabal test: $OUT"
+  end_section cabal-abi-test
 }
 
 function cabal_test() {
@@ -737,7 +781,7 @@ function cabal_test() {
     fail "OUT not set"
   fi
 
-  start_section "Cabal test: $OUT"
+  start_section cabal-test "Cabal test: $OUT"
   mkdir -p "$OUT"
   run "$HC" \
     -hidir tmp -odir tmp -fforce-recomp \
@@ -746,7 +790,7 @@ function cabal_test() {
     -ilibraries/Cabal/Cabal/src -XNoPolyKinds Distribution.Simple \
     "$@" 2>&1 | tee $OUT/log
   rm -Rf tmp
-  end_section "Cabal test: $OUT"
+  end_section cabal-test
 }
 
 function run_perf_test() {

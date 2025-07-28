@@ -8,10 +8,10 @@ module GHC.Tc.Solver.InertSet (
     WorkList(..), isEmptyWorkList, emptyWorkList,
     extendWorkListNonEq, extendWorkListCt,
     extendWorkListCts, extendWorkListCtList,
-    extendWorkListEq, extendWorkListEqs,
+    extendWorkListEq, extendWorkListChildEqs,
+    extendWorkListRewrittenEqs,
     appendWorkList, extendWorkListImplic,
     workListSize,
-    selectWorkItem,
 
     -- * The inert set
     InertSet(..),
@@ -70,7 +70,7 @@ import GHC.Core.Predicate
 import qualified GHC.Core.TyCo.Rep as Rep
 import GHC.Core.TyCon
 import GHC.Core.Class( classTyCon )
-import GHC.Builtin.Names( eqPrimTyConKey, heqTyConKey, eqTyConKey )
+import GHC.Builtin.Names( eqPrimTyConKey, heqTyConKey, eqTyConKey, coercibleTyConKey )
 import GHC.Utils.Misc       ( partitionWith )
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
@@ -171,17 +171,17 @@ See GHC.Tc.Solver.Monad.deferTcSForAllEq
 -- See Note [WorkList priorities]
 data WorkList
   = WL { wl_eqs_N :: [Ct]  -- /Nominal/ equalities (s ~#N t), (s ~ t), (s ~~ t)
-                           -- with empty rewriter set
+                           -- with definitely-empty rewriter set
+
        , wl_eqs_X :: [Ct]  -- CEqCan, CDictCan, CIrredCan
-                           -- with empty rewriter set
+                           -- with definitely-empty rewriter set
            -- All other equalities: contains both equality constraints and
            -- their class-level variants (a~b) and (a~~b);
            -- See Note [Prioritise equalities]
            -- See Note [Prioritise class equalities]
 
-       , wl_rw_eqs  :: [Ct]  -- Like wl_eqs, but ones that have a non-empty
-                             -- rewriter set; or, more precisely, did when
-                             -- added to the WorkList
+       , wl_rw_eqs  :: [Ct]  -- Like wl_eqs, but ones that may have a non-empty
+                             -- rewriter set
          -- We prioritise wl_eqs over wl_rw_eqs;
          -- see Note [Prioritise Wanteds with empty RewriterSet]
          -- in GHC.Tc.Types.Constraint for more details.
@@ -230,18 +230,20 @@ extendWorkListEq rewriters ct
   | otherwise
   = wl { wl_rw_eqs = ct : rw_eqs }
 
-extendWorkListEqs :: RewriterSet -> Bag Ct -> WorkList -> WorkList
+extendWorkListChildEqs :: CtEvidence -> Bag Ct -> WorkList -> WorkList
 -- Add [eq1,...,eqn] to the work-list
--- They all have the same rewriter set
 -- The constraints will be solved in left-to-right order:
 --   see Note [Work-list ordering] in GHC.Tc.Solver.Equality
 --
+-- Precondition: if the parent constraint has an empty
+--               rewriter set, so will the new equalities
 -- Precondition: new_eqs is non-empty
-extendWorkListEqs rewriters new_eqs
+extendWorkListChildEqs parent_ev new_eqs
     wl@(WL { wl_eqs_N = eqs_N, wl_eqs_X = eqs_X, wl_rw_eqs = rw_eqs })
-  | isEmptyRewriterSet rewriters
+  | isEmptyRewriterSet (ctEvRewriters parent_ev)
     -- isEmptyRewriterSet: see Note [Prioritise Wanteds with empty RewriterSet]
     --                         in GHC.Tc.Types.Constraint
+    -- If the rewriter set is empty, add to wl_eqs_X and wl_eqs_N
   = case partitionBag isNominalEqualityCt new_eqs of
        (new_eqs_N, new_eqs_X)
           | isEmptyBag new_eqs_N -> wl { wl_eqs_X = new_eqs_X `push_on_front` eqs_X }
@@ -251,12 +253,17 @@ extendWorkListEqs rewriters new_eqs
           -- These isEmptyBag tests are just trying
           -- to avoid creating unnecessary thunks
 
-  | otherwise
+  | otherwise  -- If the rewriter set is non-empty, add to wl_rw_eqs
   = wl { wl_rw_eqs = new_eqs `push_on_front` rw_eqs }
   where
     push_on_front :: Bag Ct -> [Ct] -> [Ct]
-    -- push_on_front puts the new equlities on the front of the queue
+    -- push_on_front puts the new equalities on the front of the queue
     push_on_front new_eqs eqs = foldr (:) eqs new_eqs
+
+extendWorkListRewrittenEqs :: [EqCt] -> WorkList -> WorkList
+-- Don't bother checking the RewriterSet: just pop them into wl_rw_eqs
+extendWorkListRewrittenEqs new_eqs wl@(WL { wl_rw_eqs = rw_eqs })
+  = wl { wl_rw_eqs = foldr ((:) . CEqCan) rw_eqs new_eqs }
 
 extendWorkListNonEq :: Ct -> WorkList -> WorkList
 -- Extension by non equality
@@ -295,16 +302,6 @@ isEmptyWorkList (WL { wl_eqs_N = eqs_N, wl_eqs_X = eqs_X, wl_rw_eqs = rw_eqs
 emptyWorkList :: WorkList
 emptyWorkList = WL { wl_eqs_N = [], wl_eqs_X = []
                    , wl_rw_eqs = [], wl_rest = [], wl_implics = emptyBag }
-
-selectWorkItem :: WorkList -> Maybe (Ct, WorkList)
--- See Note [Prioritise equalities]
-selectWorkItem wl@(WL { wl_eqs_N = eqs_N, wl_eqs_X = eqs_X
-                      , wl_rw_eqs = rw_eqs, wl_rest = rest })
-  | ct:cts <- eqs_N  = Just (ct, wl { wl_eqs_N  = cts })
-  | ct:cts <- eqs_X  = Just (ct, wl { wl_eqs_X  = cts })
-  | ct:cts <- rw_eqs = Just (ct, wl { wl_rw_eqs = cts })
-  | ct:cts <- rest   = Just (ct, wl { wl_rest   = cts })
-  | otherwise        = Nothing
 
 -- Pretty printing
 instance Outputable WorkList where
@@ -374,20 +371,20 @@ instance Outputable InertSet where
          where
            dicts = bagToList (dictsToBag solved_dicts)
 
-emptyInertCans :: InertCans
-emptyInertCans
+emptyInertCans :: TcLevel -> InertCans
+emptyInertCans given_eq_lvl
   = IC { inert_eqs          = emptyTyEqs
        , inert_funeqs       = emptyFunEqs
-       , inert_given_eq_lvl = topTcLevel
+       , inert_given_eq_lvl = given_eq_lvl
        , inert_given_eqs    = False
        , inert_dicts        = emptyDictMap
        , inert_safehask     = emptyDictMap
        , inert_insts        = []
        , inert_irreds       = emptyBag }
 
-emptyInert :: InertSet
-emptyInert
-  = IS { inert_cans           = emptyInertCans
+emptyInert :: TcLevel -> InertSet
+emptyInert given_eq_lvl
+  = IS { inert_cans           = emptyInertCans given_eq_lvl
        , inert_cycle_breakers = emptyBag :| []
        , inert_famapp_cache   = emptyFunEqs
        , inert_solved_dicts   = emptyDictMap }
@@ -677,6 +674,23 @@ should update inert_given_eq_lvl?
    representational), because representational equalities can still
    imply nominal ones. For example, if (G a ~R G b) and G's argument's
    role is nominal, then we can deduce a ~N b.
+
+(TGE6) A subtle point is this: when initialising the solver, giving it
+   an empty InertSet, we must conservatively initialise `inert_given_lvl`
+   to the /current/ TcLevel.  This matters when doing let-generalisation.
+   Consider #26004:
+      f w e = case e of
+                  T1 -> let y = not w in False   -- T1 is a GADT
+                  T2 -> True
+   When let-generalising `y`, we will have (w :: alpha[1]) in the type
+   envt; and we are under GADT pattern match.  So when we solve the
+   constraints from y's RHS, in simplifyInfer, we must NOT unify
+       alpha[1] := Bool
+   Since we don't know what enclosing equalities there are, we just
+   conservatively assume that there are some.
+
+   This initialisation in done in `runTcSWithEvBinds`, which passes
+   the current TcLevl to `emptyInert`.
 
 Historical note: prior to #24938 we also ignored Given equalities that
 did not mention an "outer" type variable.  But that is wrong, as #24938
@@ -1845,21 +1859,34 @@ isOuterTyVar tclvl tv
   | otherwise  = False  -- Coercion variables; doesn't much matter
 
 noGivenNewtypeReprEqs :: TyCon -> InertSet -> Bool
--- True <=> there is no Irred looking like (N tys1 ~ N tys2)
--- See Note [Decomposing newtype equalities] (EX2) in GHC.Tc.Solver.Equality
---     This is the only call site.
-noGivenNewtypeReprEqs tc inerts
-  = not (anyBag might_help (inert_irreds (inert_cans inerts)))
+-- True <=> there is no Given looking like (N tys1 ~ N tys2)
+-- See Note [Decomposing newtype equalities] (EX3) in GHC.Tc.Solver.Equality
+noGivenNewtypeReprEqs tc (IS { inert_cans = inerts })
+  | IC { inert_irreds = irreds, inert_insts = quant_cts } <- inerts
+  = not (anyBag might_help_irred irreds || any might_help_qc quant_cts)
+    -- Look in both inert_irreds /and/ inert_insts (#26020)
   where
-    might_help irred
-      = case classifyPredType (ctEvPred (irredCtEvidence irred)) of
-          EqPred ReprEq t1 t2
-             | Just (tc1,_) <- tcSplitTyConApp_maybe t1
-             , tc == tc1
-             , Just (tc2,_) <- tcSplitTyConApp_maybe t2
-             , tc == tc2
-             -> True
-          _  -> False
+    might_help_irred (IrredCt { ir_ev = ev })
+      | EqPred ReprEq t1 t2 <- classifyPredType (ctEvPred ev)
+      = headed_by_tc t1 t2
+      | otherwise
+      = False
+
+    might_help_qc (QCI { qci_body = pred })
+      | ClassPred cls [_, t1, t2] <- classifyPredType pred
+      , cls `hasKey` coercibleTyConKey
+      = headed_by_tc t1 t2
+      | otherwise
+      = False
+
+    headed_by_tc t1 t2
+      | Just (tc1,_) <- tcSplitTyConApp_maybe t1
+      , tc == tc1
+      , Just (tc2,_) <- tcSplitTyConApp_maybe t2
+      , tc == tc2
+      = True
+      | otherwise
+      = False
 
 -- | Is it (potentially) loopy to use the first @ct1@ to solve @ct2@?
 --
@@ -2062,18 +2089,8 @@ solveOneFromTheOther.
        (a) If both are GivenSCOrigin, choose the one that is unblocked if possible
            according to Note [Solving superclass constraints] in GHC.Tc.TyCl.Instance.
 
-       (b) Prefer constraints that are not superclass selections. Example:
-
-             f :: (Eq a, Ord a) => a -> Bool
-             f x = x == x
-
-           Eager superclass expansion gives us two [G] Eq a constraints. We
-           want to keep the one from the user-written Eq a, not the superclass
-           selection. This means we report the Ord a as redundant with
-           -Wredundant-constraints, not the Eq a.
-
-           Getting this wrong was #20602. See also
-           Note [Tracking redundant constraints] in GHC.Tc.Solver.
+       (b) Prefer constraints that are not superclass selections. See
+           (TRC3) in Note [Tracking redundant constraints] in GHC.Tc.Solver.
 
        (c) If both are GivenSCOrigin, chooose the one with the shallower
            superclass-selection depth, in the hope of identifying more correct

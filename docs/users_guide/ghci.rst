@@ -251,8 +251,8 @@ We can compile ``D``, then load the whole program, like this:
 
 .. code-block:: none
 
-    ghci> :! ghc -c -dynamic D.hs
-    ghci> :load A
+    ghci> :! ghc -c -this-unit-id interactive-session -dynamic D.hs
+    ghci> :load A B C D
     Compiling B                ( B.hs, interpreted )
     Compiling C                ( C.hs, interpreted )
     Compiling A                ( A.hs, interpreted )
@@ -267,6 +267,10 @@ compilation.
 Note the :ghc-flag:`-dynamic` flag to GHC: GHCi uses dynamically-linked object
 code (if you are on a platform that supports it), and so in order to use
 compiled code with GHCi it must be compiled for dynamic linking.
+
+Also, note the :ghc-flag:`-this-unit-id ⟨unit-id⟩` `interactive-session` to GHC: GHCi
+can only use the object code of a module loaded via :ghci-cmd:`:load`,
+if the object code has been compiled for the `interactive-session`.
 
 At any time you can use the command :ghci-cmd:`:show modules` to get a list of
 the modules currently loaded into GHCi:
@@ -301,8 +305,8 @@ So let's try compiling one of the other modules:
 
 .. code-block:: none
 
-    *ghci> :! ghc -c C.hs
-    *ghci> :load A
+    *ghci> :! ghc -c -this-unit-id interactive-session -dynamic C.hs
+    *ghci> :load A B C D
     Compiling D                ( D.hs, interpreted )
     Compiling B                ( B.hs, interpreted )
     Compiling C                ( C.hs, interpreted )
@@ -316,7 +320,7 @@ rejected ``C``\'s object file. Ok, so let's also compile ``D``:
 
 .. code-block:: none
 
-    *ghci> :! ghc -c D.hs
+    *ghci> :! ghc -c -this-unit-id interactive-session -dynamic D.hs
     *ghci> :reload
     Ok, modules loaded: A, B, C, D.
 
@@ -325,7 +329,7 @@ picked up by :ghci-cmd:`:reload`, only :ghci-cmd:`:load`:
 
 .. code-block:: none
 
-    *ghci> :load A
+    *ghci> :load A B C D
     Compiling B                ( B.hs, interpreted )
     Compiling A                ( A.hs, interpreted )
     Ok, modules loaded: A, B, C (C.o), D (D.o).
@@ -2083,6 +2087,19 @@ mostly obvious.
     that any previously loaded modules have been correctly garbage
     collected. Emits messages if a leak is detected.
 
+.. ghc-flag:: -fload-initial-targets
+    :shortdesc: Load targets on GHCi startup.
+    :type: dynamic
+    :reverse: -fno-load-initial-targets
+    :category:
+
+    :default: on
+    :since: 9.14.1
+
+    Compile all targets on GHCi startup.
+    By disabling this flag you can speed up the initial start time of GHCi.
+    When targets are needed, they can be loaded by using the :ghci-cmd:`:reload`.
+
 Packages
 ~~~~~~~~
 
@@ -2755,7 +2772,7 @@ commonly used commands.
 
     Quits GHCi. You can also quit by typing :kbd:`Control-D` at the prompt.
 
-.. ghci-cmd:: :reload;[!]
+.. ghci-cmd:: :reload;[!] [none | ⟨mod1⟩ ...]
 
     Attempts to reload the current target set (see :ghci-cmd:`:load`) if any of
     the modules in the set, or any dependent module, has changed. Note
@@ -2768,6 +2785,11 @@ commonly used commands.
     Effectively, the :ghc-flag:`-fdefer-type-errors` flag is set before loading
     and unset after loading if the flag has not already been set before.
     See :ref:`defer-type-errors` for further motivation and details.
+
+    If given a module name target, GHCi will load all modules in the module graph
+    up to the given module name ``⟨mod1⟩``. If multiple name targets are given, all module
+    targets will be loaded.
+    To unload all currently loaded targets, the target ``none`` unloads all targets.
 
 .. ghci-cmd:: :run
 
@@ -2979,6 +3001,37 @@ commonly used commands.
     :ghci-cmd:`:steplocal` is not possible if this last breakpoint was
     hit by an error (:ghc-flag:`-fbreak-on-error`) or an
     exception (:ghc-flag:`-fbreak-on-exception`).
+
+.. ghci-cmd:: :stepout
+
+    :since: 9.14.1
+
+    Stop at the first breakpoint immediately after returning from the current
+    function scope.
+
+    Known limitations: because a function tail-call does not push a stack
+    frame, if step-out is used inside of a function that was tail-called,
+    execution will not be returned to its caller, but rather its caller's
+    first non-tail caller. On the other hand, it means the debugger
+    follows the more realistic execution of the program.
+    In the following example:
+
+    .. code-block:: none
+
+    f = do
+       a
+       b <--- (1) set breakpoint then step in here
+       c
+    b = do
+       ...
+       d <--- (2) step-into this tail call
+    d = do
+       ...
+       something <--- (3) step-out here
+       ...
+
+    Stepping-out will stop execution at the `c` invokation in `f`, rather than
+    stopping at `b`.
 
 .. ghci-cmd:: :stepmodule
 

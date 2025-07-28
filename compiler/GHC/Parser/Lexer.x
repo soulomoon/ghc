@@ -947,14 +947,17 @@ data Token
   | ITdollar                            --  prefix $
   | ITdollardollar                      --  prefix $$
   | ITtyQuote                           --  ''
-  | ITquasiQuote (FastString,FastString,PsSpan)
-    -- ITquasiQuote(quoter, quote, loc)
+  | ITquasiQuote (FastString, PsSpan, FastString, PsSpan)
+    -- ITquasiQuote(quoter, quoter_loc, quote, quote_loc)
     -- represents a quasi-quote of the form
     -- [quoter| quote |]
-  | ITqQuasiQuote (FastString,FastString,FastString,PsSpan)
-    -- ITqQuasiQuote(Qual, quoter, quote, loc)
+  | ITqQuasiQuote (FastString,FastString,PsSpan, FastString, PsSpan)
+    -- ITqQuasiQuote(Qual, quoter, quoter_loc, quote, quote_loc)
     -- represents a qualified quasi-quote of the form
     -- [Qual.quoter| quote |]
+
+  | ITsplice
+  | ITquote
 
   -- Arrow notation extension
   | ITproc
@@ -1095,7 +1098,9 @@ reservedWordsFM = listToUFM $
 
          ( "rec",            ITrec,           xbit ArrowsBit .|.
                                               xbit RecursiveDoBit),
-         ( "proc",           ITproc,          xbit ArrowsBit)
+         ( "proc",           ITproc,          xbit ArrowsBit),
+         ( "splice",         ITsplice,        xbit LevelImportsBit),
+         ( "quote",          ITquote,         xbit LevelImportsBit)
      ]
 
 {-----------------------------------
@@ -2283,11 +2288,16 @@ lex_qquasiquote_tok :: Action
 lex_qquasiquote_tok span buf len _buf2 = do
   let (qual, quoter) = splitQualName (stepOn buf) (len - 2) False
   quoteStart <- getParsedLoc
+  let quoter_span_start = advancePsLoc (psSpanStart span) '['
+      quoter_span_end   = foldl' advancePsLoc quoter_span_start
+                            (take (len - 2) (repeat 'a'))
+      quoter_span       = mkPsSpan quoter_span_start quoter_span_end
   quote <- lex_quasiquote (psRealLoc quoteStart) ""
   end <- getParsedLoc
   return (L (mkPsSpan (psSpanStart span) end)
            (ITqQuasiQuote (qual,
                            quoter,
+                           quoter_span,
                            mkFastString (reverse quote),
                            mkPsSpan quoteStart end)))
 
@@ -2297,10 +2307,14 @@ lex_quasiquote_tok span buf len _buf2 = do
                 -- 'tail' drops the initial '[',
                 -- while the -1 drops the trailing '|'
   quoteStart <- getParsedLoc
+  let quoter_span_start = advancePsLoc (psSpanStart span) '['
+      quoter_span_end   = foldl' advancePsLoc quoter_span_start quoter
+      quoter_span       = mkPsSpan quoter_span_start quoter_span_end
   quote <- lex_quasiquote (psRealLoc quoteStart) ""
   end <- getParsedLoc
   return (L (mkPsSpan (psSpanStart span) end)
            (ITquasiQuote (mkFastString quoter,
+                          quoter_span,
                           mkFastString (reverse quote),
                           mkPsSpan quoteStart end)))
 
@@ -2775,6 +2789,7 @@ data ExtBits
   | ViewPatternsBit
   | RequiredTypeArgumentsBit
   | MultilineStringsBit
+  | LevelImportsBit
 
   -- Flags that are updated once parsing starts
   | InRulePragBit
@@ -2858,6 +2873,7 @@ mkParserOpts extensionFlags diag_opts
       .|. ViewPatternsBit             `xoptBit` LangExt.ViewPatterns
       .|. RequiredTypeArgumentsBit    `xoptBit` LangExt.RequiredTypeArguments
       .|. MultilineStringsBit         `xoptBit` LangExt.MultilineStrings
+      .|. LevelImportsBit             `xoptBit` LangExt.ExplicitLevelImports
     optBits =
           HaddockBit        `setBitIf` isHaddock
       .|. RawTokenStreamBit `setBitIf` rawTokStream

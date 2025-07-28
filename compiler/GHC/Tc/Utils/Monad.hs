@@ -20,7 +20,8 @@ module GHC.Tc.Utils.Monad(
   updTopFlags,
   getEnvs, setEnvs, updEnvs, restoreEnvs,
   xoptM, doptM, goptM, woptM,
-  setXOptM, unsetXOptM, unsetGOptM, unsetWOptM,
+  setXOptM, setWOptM,
+  unsetXOptM, unsetGOptM, unsetWOptM,
   whenDOptM, whenGOptM, whenWOptM,
   whenXOptM, unlessXOptM,
   getGhcMode,
@@ -117,7 +118,7 @@ module GHC.Tc.Utils.Monad(
 
   -- * Template Haskell context
   recordThUse, recordThNeededRuntimeDeps,
-  keepAlive, getStage, getStageAndBindLevel, setStage,
+  keepAlive, getThLevel, getCurrentAndBindLevel, setThLevel,
   addModFinalizersWithLclEnv,
 
   -- * Safe Haskell context
@@ -169,6 +170,7 @@ import GHC.Tc.Types.Evidence
 import GHC.Tc.Types.LclEnv
 import GHC.Tc.Types.Origin
 import GHC.Tc.Types.TcRef
+import GHC.Tc.Types.TH
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Zonk.TcType
 
@@ -209,6 +211,7 @@ import GHC.Utils.Panic
 import GHC.Utils.Constants (debugIsOn)
 import GHC.Utils.Logger
 import qualified GHC.Data.Strict as Strict
+import qualified Data.Set as Set
 
 import GHC.Types.Error
 import GHC.Types.DefaultEnv ( DefaultEnv, emptyDefaultEnv )
@@ -228,7 +231,7 @@ import GHC.Types.Unique.FM ( emptyUFM )
 import GHC.Types.Unique.DFM
 import GHC.Types.Unique.Supply
 import GHC.Types.Annotations
-import GHC.Types.Basic( TopLevelFlag, TypeOrKind(..) )
+import GHC.Types.Basic( TopLevelFlag(..), TypeOrKind(..) )
 import GHC.Types.CostCentre.State
 import GHC.Types.SourceFile
 
@@ -325,6 +328,7 @@ initTc hsc_env hsc_src keep_rn_syntax mod loc do_this
                 tcg_inst_env       = emptyInstEnv,
                 tcg_fam_inst_env   = emptyFamInstEnv,
                 tcg_ann_env        = emptyAnnEnv,
+                tcg_complete_match_env = [],
                 tcg_th_used        = th_var,
                 tcg_th_needed_deps = th_needed_deps_var,
                 tcg_exports        = [],
@@ -398,7 +402,7 @@ initTcWithGbl hsc_env gbl_env loc do_this
                 tcl_in_gen_code = False,
                 tcl_ctxt       = [],
                 tcl_rdr        = emptyLocalRdrEnv,
-                tcl_th_ctxt    = topStage,
+                tcl_th_ctxt    = topLevel,
                 tcl_th_bndrs   = emptyNameEnv,
                 tcl_arrow_ctxt = NoArrowCtxt,
                 tcl_env        = emptyNameEnv,
@@ -578,6 +582,9 @@ woptM flag = wopt flag <$> getDynFlags
 
 setXOptM :: LangExt.Extension -> TcRnIf gbl lcl a -> TcRnIf gbl lcl a
 setXOptM flag = updTopFlags (\dflags -> xopt_set dflags flag)
+
+setWOptM :: WarningFlag -> TcRnIf gbl lcl a -> TcRnIf gbl lcl a
+setWOptM flag = updTopFlags (\dflags -> wopt_set dflags flag)
 
 unsetXOptM :: LangExt.Extension -> TcRnIf gbl lcl a -> TcRnIf gbl lcl a
 unsetXOptM flag = updTopFlags (\dflags -> xopt_unset dflags flag)
@@ -1379,11 +1386,13 @@ tryCaptureConstraints thing_inside
                           tcTryM thing_inside
 
        -- See Note [Constraints and errors]
-       ; let lie_to_keep = case mb_res of
-                             Nothing -> dropMisleading lie
-                             Just {} -> lie
-
-       ; return (mb_res, lie_to_keep) }
+       ; case mb_res of
+            Just {} -> return (mb_res, lie)
+            Nothing -> do { let pruned_lie = dropMisleading lie
+                          ; traceTc "tryCaptureConstraints" $
+                            vcat [ text "lie:" <+> ppr lie
+                                 , text "dropMisleading lie:" <+> ppr pruned_lie ]
+                          ; return (Nothing, pruned_lie) } }
 
 captureConstraints :: TcM a -> TcM (a, WantedConstraints)
 -- (captureConstraints m) runs m, and returns the type constraints it generates
@@ -2060,28 +2069,51 @@ It's distressingly delicate though:
   emitted some constraints with skolem-escape problems.
 
 * If we discard too /few/ constraints, we may get the misleading
-  class constraints mentioned above.  But we may /also/ end up taking
-  constraints built at some inner level, and emitting them at some
-  outer level, and then breaking the TcLevel invariants
-  See Note [TcLevel invariants] in GHC.Tc.Utils.TcType
+  class constraints mentioned above.
 
-So dropMisleading has a horridly ad-hoc structure.  It keeps only
-/insoluble/ flat constraints (which are unlikely to very visibly trip
-up on the TcLevel invariant, but all /implication/ constraints (except
-the class constraints inside them).  The implication constraints are
-OK because they set the ambient level before attempting to solve any
-inner constraints.  Ugh! I hate this. But it seems to work.
+  We may /also/ end up taking constraints built at some inner level, and
+  emitting them (via the exception catching in `tryCaptureConstraints` at some
+  outer level, and then breaking the TcLevel invariants See Note [TcLevel
+  invariants] in GHC.Tc.Utils.TcType
 
-However note that freshly-generated constraints like (Int ~ Bool), or
-((a -> b) ~ Int) are all CNonCanonical, and hence won't be flagged as
-insoluble.  The constraint solver does that.  So they'll be discarded.
-That's probably ok; but see th/5358 as a not-so-good example:
-   t1 :: Int
-   t1 x = x   -- Manifestly wrong
+So `dropMisleading` has a horridly ad-hoc structure:
 
-   foo = $(...raises exception...)
-We report the exception, but not the bug in t1.  Oh well.  Possible
-solution: make GHC.Tc.Utils.Unify.uType spot manifestly-insoluble constraints.
+* It keeps only /insoluble/ flat constraints (which are unlikely to very visibly
+  trip up on the TcLevel invariant
+
+* But it keeps all /implication/ constraints (except the class constraints
+  inside them).  The implication constraints are OK because they set the ambient
+  level before attempting to solve any inner constraints.
+
+Ugh! I hate this. But it seems to work.
+
+Other wrinkles
+
+(CERR1) Note that freshly-generated constraints like (Int ~ Bool), or
+    ((a -> b) ~ Int) are all CNonCanonical, and hence won't be flagged as
+    insoluble.  The constraint solver does that.  So they'll be discarded.
+    That's probably ok; but see th/5358 as a not-so-good example:
+       t1 :: Int
+       t1 x = x   -- Manifestly wrong
+
+       foo = $(...raises exception...)
+    We report the exception, but not the bug in t1.  Oh well.  Possible
+    solution: make GHC.Tc.Utils.Unify.uType spot manifestly-insoluble constraints.
+
+(CERR2) In #26015 I found that from the constraints
+           [W] alpha ~ Int      -- A class constraint
+           [W] F alpha ~# Bool  -- An equality constraint
+  we were dropping the first (becuase it's a class constraint) but not the
+  second, and then getting a misleading error message from the second.  As
+  #25607 shows, we can get not just one but a zillion bogus messages, which
+  conceal the one genuine error.  Boo.
+
+  For now I have added an even more ad-hoc "drop class constraints except
+  equality classes (~) and (~~)"; see `dropMisleading`.  That just kicks the can
+  down the road; but this problem seems somewhat rare anyway.  The code in
+  `dropMisleading` hasn't changed for years.
+
+It would be great to have a more systematic solution to this entire mess.
 
 
 ************************************************************************
@@ -2109,18 +2141,38 @@ keepAlive name
        ; traceRn "keep alive" (ppr name)
        ; updTcRef (tcg_keep env) (`extendNameSet` name) }
 
-getStage :: TcM ThStage
-getStage = do { env <- getLclEnv; return (getLclEnvThStage env) }
+getThLevel :: TcM ThLevel
+getThLevel = do { env <- getLclEnv; return (getLclEnvThLevel env) }
 
-getStageAndBindLevel :: Name -> TcRn (Maybe (TopLevelFlag, ThLevel, ThStage))
-getStageAndBindLevel name
+getCurrentAndBindLevel :: Name -> TcRn (Maybe (TopLevelFlag, Set.Set ThLevelIndex, ThLevel))
+getCurrentAndBindLevel name
   = do { env <- getLclEnv;
        ; case lookupNameEnv (getLclEnvThBndrs env) name of
-           Nothing                  -> return Nothing
-           Just (top_lvl, bind_lvl) -> return (Just (top_lvl, bind_lvl, getLclEnvThStage env)) }
+           Nothing                  -> do
+              lvls <- getExternalBindLvl name
+              if Set.empty == lvls
+                -- This case happens when code is generated for identifiers which are not
+                -- in scope.
+                --
+                -- TODO: What happens if someone generates [|| GHC.Magic.dataToTag# ||]
+                then do
+                  return Nothing
+                else return (Just (TopLevel, lvls, getLclEnvThLevel env))
+           Just (top_lvl, bind_lvl) -> return (Just (top_lvl, Set.singleton bind_lvl, getLclEnvThLevel env)) }
 
-setStage :: ThStage -> TcM a -> TcRn a
-setStage s = updLclEnv (setLclEnvThStage s)
+getExternalBindLvl :: Name -> TcRn (Set.Set ThLevelIndex)
+getExternalBindLvl name = do
+  env <- getGlobalRdrEnv
+  mod <- getModule
+  case lookupGRE_Name env name of
+    Just gre -> return $ (Set.map thLevelIndexFromImportLevel (greLevels gre))
+    Nothing ->
+      if nameIsLocalOrFrom mod name
+        then return $ Set.singleton topLevelIndex
+        else return Set.empty
+
+setThLevel :: ThLevel -> TcM a -> TcRn a
+setThLevel l = updLclEnv (setLclEnvThLevel l)
 
 -- | Adds the given modFinalizers to the global environment and set them to use
 -- the current local environment.
@@ -2374,15 +2426,14 @@ liftZonkM (ZonkM f) =
 getCompleteMatchesTcM :: TcM CompleteMatches
 getCompleteMatchesTcM
   = do { hsc_env <- getTopEnv
-       ; tcg_env <- getGblEnv
        ; eps <- liftIO $ hscEPS hsc_env
-       ; liftIO $ localAndImportedCompleteMatches (tcg_complete_matches tcg_env) (hsc_unit_env hsc_env) eps
+       ; tcg_env <- getGblEnv
+       ; let tcg_comps = tcg_complete_match_env tcg_env
+       ; liftIO $ localAndImportedCompleteMatches tcg_comps eps
        }
 
-localAndImportedCompleteMatches :: CompleteMatches -> UnitEnv -> ExternalPackageState -> IO CompleteMatches
-localAndImportedCompleteMatches tcg_comps unit_env eps = do
-  hugCSigs <- hugCompleteSigs unit_env
+localAndImportedCompleteMatches :: CompleteMatches -> ExternalPackageState -> IO CompleteMatches
+localAndImportedCompleteMatches tcg_comps eps = do
   return $
-       tcg_comps                -- from the current module
-    ++ hugCSigs                 -- from the home package
-    ++ eps_complete_matches eps -- from imports
+       tcg_comps                -- from the current modulea and from the home package
+    ++ eps_complete_matches eps -- from external packages

@@ -21,17 +21,15 @@ module GHC.Runtime.Interpreter
   , mkCostCentres
   , costCentreStackInfo
   , newBreakArray
-  , newModuleName
   , storeBreakpoint
   , breakpointStatus
   , getBreakpointVar
   , getClosure
   , whereFrom
   , getModBreaks
+  , readModBreaks
   , seqHValue
   , evalBreakpointToId
-  , interpreterDynamic
-  , interpreterProfiled
 
   -- * The object-code linker
   , initObjLinker
@@ -76,9 +74,9 @@ import GHCi.Message
 import GHCi.RemoteTypes
 import GHCi.ResolvedBCO
 import GHCi.BreakArray (BreakArray)
-import GHC.Types.Breakpoint
-import GHC.ByteCode.Types
+import GHC.ByteCode.Breakpoints
 
+import GHC.ByteCode.Types
 import GHC.Linker.Types
 
 import GHC.Data.Maybe
@@ -93,14 +91,12 @@ import GHC.Utils.Outputable(brackets, ppr, showSDocUnsafe)
 import GHC.Utils.Fingerprint
 
 import GHC.Unit.Module
-import GHC.Unit.Module.ModIface
 import GHC.Unit.Home.ModInfo
-import GHC.Unit.Home.PackageTable
+import GHC.Unit.Home.Graph (lookupHugByModule)
 import GHC.Unit.Env
 
 #if defined(HAVE_INTERNAL_INTERPRETER)
 import GHCi.Run
-import GHC.Platform.Ways
 #endif
 
 import Control.Concurrent
@@ -109,7 +105,6 @@ import Control.Monad.IO.Class
 import Control.Monad.Catch as MC (mask)
 import Data.Binary
 import Data.ByteString (ByteString)
-import Data.Array ((!))
 import Foreign hiding (void)
 import qualified GHC.Exts.Heap as Heap
 import GHC.Stack.CCS (CostCentre,CostCentreStack)
@@ -119,6 +114,7 @@ import qualified GHC.InfoProv as InfoProv
 
 import GHC.Builtin.Names
 import GHC.Types.Name
+import qualified GHC.Unit.Home.Graph as HUG
 
 -- Standard libraries
 import GHC.Exts
@@ -377,10 +373,6 @@ newBreakArray interp size = do
   breakArray <- interpCmd interp (NewBreakArray size)
   mkFinalizedHValue interp breakArray
 
-newModuleName :: Interp -> ModuleName -> IO (RemotePtr ModuleName)
-newModuleName interp mod_name =
-  castRemotePtr <$> interpCmd interp (NewBreakModule (moduleNameString mod_name))
-
 storeBreakpoint :: Interp -> ForeignRef BreakArray -> Int -> Int -> IO ()
 storeBreakpoint interp ref ix cnt = do                               -- #19157
   withForeignRef ref $ \breakarray ->
@@ -415,19 +407,21 @@ seqHValue interp unit_env ref =
     status <- interpCmd interp (Seq hval)
     handleSeqHValueStatus interp unit_env status
 
-evalBreakpointToId :: HomePackageTable -> EvalBreakpoint -> IO InternalBreakpointId
-evalBreakpointToId hpt eval_break =
-  let load_mod x = mi_module . hm_iface . expectJust <$> lookupHpt hpt (mkModuleName x)
-  in do
-    tickl <- load_mod (eb_tick_mod eval_break)
-    infol <- load_mod (eb_info_mod eval_break)
-    return
-      InternalBreakpointId
-        { ibi_tick_mod   = tickl
-        , ibi_tick_index = eb_tick_index eval_break
-        , ibi_info_mod   = infol
-        , ibi_info_index = eb_info_index eval_break
-        }
+evalBreakpointToId :: EvalBreakpoint -> InternalBreakpointId
+evalBreakpointToId eval_break =
+  let
+    mkUnitId u = fsToUnit $ mkFastStringShortByteString u
+
+    toModule u n = mkModule (mkUnitId u) (mkModuleName n)
+    tickl = toModule (eb_tick_mod_unit eval_break) (eb_tick_mod eval_break)
+    infol = toModule (eb_info_mod_unit eval_break) (eb_info_mod eval_break)
+  in
+    InternalBreakpointId
+      { ibi_tick_mod   = tickl
+      , ibi_tick_index = eb_tick_index eval_break
+      , ibi_info_mod   = infol
+      , ibi_info_index = eb_info_index eval_break
+      }
 
 -- | Process the result of a Seq or ResumeSeq message.             #2950
 handleSeqHValueStatus :: Interp -> UnitEnv -> EvalStatus () -> IO (EvalResult ())
@@ -439,22 +433,24 @@ handleSeqHValueStatus interp unit_env eval_status =
       resume_ctxt_fhv <- liftIO $ mkFinalizedHValue interp resume_ctxt
 
       let put x = putStrLn ("*** Ignoring breakpoint " ++ (showSDocUnsafe x))
+      let nothing_case = put $ brackets . ppr $ mkGeneralSrcSpan (fsLit "<unknown>")
       case maybe_break of
-        Nothing ->
+        Nothing -> nothing_case
           -- Nothing case - should not occur!
           -- Reason: Setting of flags in libraries/ghci/GHCi/Run.hs:evalOptsSeq
-          put $ brackets . ppr $
-            mkGeneralSrcSpan (fsLit "<unknown>")
 
         Just break -> do
-          bi <- evalBreakpointToId (ue_hpt unit_env) break
+          let bi = evalBreakpointToId break
 
           -- Just case: Stopped at a breakpoint, extract SrcSpan information
           -- from the breakpoint.
-          breaks_tick <- getModBreaks . expectJust <$>
-                          lookupHpt (ue_hpt unit_env) (moduleName (ibi_tick_mod bi))
-          put $ brackets . ppr $
-            (modBreaks_locs breaks_tick) ! ibi_tick_index bi
+          mb_modbreaks <- getModBreaks . expectJust <$>
+                          lookupHugByModule (ibi_tick_mod bi) (ue_home_unit_graph unit_env)
+          case mb_modbreaks of
+            -- Nothing case - should not occur! We should have the appropriate
+            -- breakpoint information
+            Nothing -> nothing_case
+            Just modbreaks -> put $ brackets . ppr $ getBreakLoc bi modbreaks
 
       -- resume the seq (:force) processing in the iserv process
       withForeignRef resume_ctxt_fhv $ \hval -> do
@@ -734,6 +730,26 @@ wormholeRef interp _r = case interpInstance interp of
   ExternalInterp {}
     -> throwIO (InstallationError "this operation requires -fno-external-interpreter")
 
+--------------------------------------------------------------------------------
+-- * Finding breakpoint information
+--------------------------------------------------------------------------------
+
+-- | Get the breakpoint information from the ByteCode object associated to this
+-- 'HomeModInfo'.
+getModBreaks :: HomeModInfo -> Maybe InternalModBreaks
+getModBreaks hmi
+  | Just linkable <- homeModInfoByteCode hmi,
+    -- The linkable may have 'DotO's as well; only consider BCOs. See #20570.
+    [cbc] <- linkableBCOs linkable
+  = bc_breaks cbc
+  | otherwise
+  = Nothing -- probably object code
+
+-- | Read the 'InternalModBreaks' and 'ModBreaks' of the given home 'Module'
+-- from the 'HomeUnitGraph'.
+readModBreaks :: HomeUnitGraph -> Module -> IO InternalModBreaks
+readModBreaks hug modl = expectJust . getModBreaks . expectJust <$> HUG.lookupHugByModule modl hug
+
 -- -----------------------------------------------------------------------------
 -- Misc utils
 
@@ -741,33 +757,3 @@ fromEvalResult :: EvalResult a -> IO a
 fromEvalResult (EvalException e) = throwIO (fromSerializableException e)
 fromEvalResult (EvalSuccess a) = return a
 
-getModBreaks :: HomeModInfo -> ModBreaks
-getModBreaks hmi
-  | Just linkable <- homeModInfoByteCode hmi,
-    -- The linkable may have 'DotO's as well; only consider BCOs. See #20570.
-    [cbc] <- linkableBCOs linkable
-  = fromMaybe emptyModBreaks (bc_breaks cbc)
-  | otherwise
-  = emptyModBreaks -- probably object code
-
--- | Interpreter uses Profiling way
-interpreterProfiled :: Interp -> Bool
-interpreterProfiled interp = case interpInstance interp of
-#if defined(HAVE_INTERNAL_INTERPRETER)
-  InternalInterp     -> hostIsProfiled
-#endif
-  ExternalInterp ext -> case ext of
-    ExtIServ i -> iservConfProfiled (interpConfig i)
-    ExtJS {}   -> False -- we don't support profiling yet in the JS backend
-    ExtWasm i -> wasmInterpProfiled $ interpConfig i
-
--- | Interpreter uses Dynamic way
-interpreterDynamic :: Interp -> Bool
-interpreterDynamic interp = case interpInstance interp of
-#if defined(HAVE_INTERNAL_INTERPRETER)
-  InternalInterp     -> hostIsDynamic
-#endif
-  ExternalInterp ext -> case ext of
-    ExtIServ i -> iservConfDynamic (interpConfig i)
-    ExtJS {}   -> False -- dynamic doesn't make sense for JS
-    ExtWasm {} -> True  -- wasm dyld can only load dynamic code

@@ -15,7 +15,7 @@ module GHC.Tc.Types.Origin (
 
   -- * SkolemInfo
   SkolemInfo(..), SkolemInfoAnon(..), mkSkolemInfo, getSkolemInfo, pprSigSkolInfo, pprSkolInfo,
-  unkSkol, unkSkolAnon, mkClsInstSkol,
+  unkSkol, unkSkolAnon,
 
   -- * CtOrigin
   CtOrigin(..), exprCtOrigin, lexprCtOrigin, matchesCtOrigin, grhssCtOrigin,
@@ -23,6 +23,7 @@ module GHC.Tc.Types.Origin (
   pprCtOrigin, isGivenOrigin, isWantedWantedFunDepOrigin,
   isWantedSuperclassOrigin,
   ClsInstOrQC(..), NakedScFlag(..), NonLinearPatternReason(..),
+  HsImplicitLiftSplice(..),
 
   TypedThing(..), TyVarBndrs(..),
 
@@ -58,7 +59,6 @@ import GHC.Hs
 import GHC.Core.DataCon
 import GHC.Core.ConLike
 import GHC.Core.TyCon
-import GHC.Core.Class
 import GHC.Core.InstEnv
 import GHC.Core.PatSyn
 import GHC.Core.Multiplicity ( scaledThing )
@@ -288,6 +288,10 @@ data SkolemInfoAnon
        ClsInstOrQC      -- Whether class instance or quantified constraint
        PatersonSize     -- Head has the given PatersonSize
 
+  | MethSkol Name Bool  -- Bound by the type of class method op
+                        -- True  <=> it's a default method
+                        -- False <=> it's a user-written method
+
   | FamInstSkol         -- Bound at a family instance decl
   | PatSkol             -- An existential type variable bound by a pattern for
       ConLike           -- a data constructor with an existential type.
@@ -348,9 +352,6 @@ mkSkolemInfo sk_anon = do
 getSkolemInfo :: SkolemInfo -> SkolemInfoAnon
 getSkolemInfo (SkolemInfo _ skol_anon) = skol_anon
 
-mkClsInstSkol :: Class -> [Type] -> SkolemInfoAnon
-mkClsInstSkol cls tys = InstSkol IsClsInst (pSizeClassPred cls tys)
-
 instance Outputable SkolemInfo where
   ppr (SkolemInfo _ sk_info ) = ppr sk_info
 
@@ -369,6 +370,8 @@ pprSkolInfo (InstSkol IsClsInst sz) = vcat [ text "the instance declaration"
                                            , whenPprDebug (braces (ppr sz)) ]
 pprSkolInfo (InstSkol (IsQC {}) sz) = vcat [ text "a quantified context"
                                            , whenPprDebug (braces (ppr sz)) ]
+pprSkolInfo (MethSkol name d) = text "the" <+> ppWhen d (text "default")
+                                           <+> text "method declaration for" <+> ppr name
 pprSkolInfo FamInstSkol       = text "a family instance declaration"
 pprSkolInfo BracketSkol       = text "a Template Haskell bracket"
 pprSkolInfo (RuleSkol name)   = text "the RULE" <+> pprRuleName name
@@ -647,6 +650,7 @@ data CtOrigin
       Type   -- the instance-sig type
       Type   -- the instantiated type of the method
   | AmbiguityCheckOrigin UserTypeCtxt
+  | ImplicitLiftOrigin HsImplicitLiftSplice
 
 data NonLinearPatternReason
   = LazyPatternReason
@@ -944,6 +948,7 @@ pprCtO (UsageEnvironmentOf x) = hsep [text "multiplicity of", quotes (ppr x)]
 pprCtO (OmittedFieldOrigin Nothing) = text "an omitted anonymous field"
 pprCtO (OmittedFieldOrigin (Just fl)) = hsep [text "omitted field" <+> quotes (ppr fl)]
 pprCtO BracketOrigin         = text "a quotation bracket"
+pprCtO (ImplicitLiftOrigin isp) = text "an implicit lift of" <+> quotes (ppr (implicit_lift_lid isp))
 
 -- These ones are handled by pprCtOrigin, but we nevertheless sometimes
 -- get here via callStackOriginFS, when doing ambiguity checks
@@ -1533,7 +1538,7 @@ data InstanceWhat  -- How did we solve this constraint?
                          -- See GHC.Tc.Solver.InertSet Note [Solved dictionaries]
 
   | BuiltinTypeableInstance TyCon   -- Built-in solver for Typeable (T t1 .. tn)
-                         -- See Note [Well-staged instance evidence]
+                         -- See Note [Well-levelled instance evidence]
 
   | BuiltinInstance      -- Built-in solver for (C t1 .. tn) where C is
                          --   KnownNat, .. etc (classes with no top-level evidence)

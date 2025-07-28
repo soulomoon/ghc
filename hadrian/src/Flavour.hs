@@ -21,6 +21,7 @@ module Flavour
   , enableHiCore
   , useNativeBignum
   , enableTextWithSIMDUTF
+  , enableHieFiles
   , omitPragmas
 
   , completeSetting
@@ -75,6 +76,7 @@ flavourTransformers = M.fromList
     , "boot_nonmoving_gc" =: enableBootNonmovingGc
     , "dump_stg"         =: enableDumpStg
     , "hash_unit_ids"    =: enableHashUnitIds
+    , "hie_files"        =: enableHieFiles
     ]
   where (=:) = (,)
 
@@ -137,6 +139,7 @@ werror =
         ? notStage0
         ? mconcat
           [ arg "-Werror"
+          , arg "-Wno-error=pattern-namespace-specifier"   -- not until the boot compiler is >=9.14
             -- unix has many unused imports
           , package unix
               ? mconcat [arg "-Wwarn=unused-imports", arg "-Wwarn=unused-top-binds"]
@@ -322,6 +325,9 @@ enableTextWithSIMDUTF flavour = flavour {
 
 enableHashUnitIds :: Flavour -> Flavour
 enableHashUnitIds flavour = flavour { hashUnitIds = True }
+
+enableHieFiles :: Flavour -> Flavour
+enableHieFiles flavour = flavour { ghcHieFiles = (>= Stage1) }
 
 -- | Build stage2 compiler with -fomit-interface-pragmas to reduce
 -- recompilation.

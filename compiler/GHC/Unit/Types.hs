@@ -1,5 +1,3 @@
-{-# OPTIONS_GHC -Wno-orphans #-} -- instance Binary IsBootInterface
-
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveTraversable #-}
@@ -65,12 +63,16 @@ module GHC.Unit.Types
    , mainUnitId
    , thisGhcUnitId
    , interactiveUnitId
+   , interactiveGhciUnitId
+   , interactiveSessionUnitId
 
    , ghcInternalUnit
    , rtsUnit
    , mainUnit
    , thisGhcUnit
    , interactiveUnit
+   , interactiveGhciUnit
+   , interactiveSessionUnit
 
    , isInteractiveModule
    , wiredInUnitIds
@@ -116,12 +118,6 @@ data GenModule unit = Module
    , moduleName :: !ModuleName -- ^ Module name (e.g. A.B.C)
    }
    deriving (Eq,Ord,Data,Functor)
-
-instance Data ModuleName where
-  -- don't traverse?
-  toConstr _   = abstractConstr "ModuleName"
-  gunfold _ _  = error "gunfold"
-  dataTypeOf _ = mkNoRepType "ModuleName"
 
 -- | A Module is a pair of a 'Unit' and a 'ModuleName'.
 type Module = GenModule Unit
@@ -596,20 +592,24 @@ Make sure you change 'GHC.Unit.State.findWiredInUnits' if you add an entry here.
 -}
 
 ghcInternalUnitId, rtsUnitId,
-  mainUnitId, thisGhcUnitId, interactiveUnitId :: UnitId
+  mainUnitId, thisGhcUnitId, interactiveUnitId, interactiveGhciUnitId, interactiveSessionUnitId :: UnitId
 
 ghcInternalUnit, rtsUnit,
-  mainUnit, thisGhcUnit, interactiveUnit :: Unit
+  mainUnit, thisGhcUnit, interactiveUnit, interactiveGhciUnit, interactiveSessionUnit :: Unit
 
 ghcInternalUnitId = UnitId (fsLit "ghc-internal")
 rtsUnitId         = UnitId (fsLit "rts")
 thisGhcUnitId     = UnitId (fsLit cProjectUnitId) -- See Note [GHC's Unit Id]
 interactiveUnitId = UnitId (fsLit "interactive")
+interactiveGhciUnitId = UnitId (fsLit "interactive-ghci")
+interactiveSessionUnitId = UnitId (fsLit "interactive-session")
 
 ghcInternalUnit   = RealUnit (Definite ghcInternalUnitId)
 rtsUnit           = RealUnit (Definite rtsUnitId)
 thisGhcUnit       = RealUnit (Definite thisGhcUnitId)
 interactiveUnit   = RealUnit (Definite interactiveUnitId)
+interactiveGhciUnit = RealUnit (Definite interactiveGhciUnitId)
+interactiveSessionUnit = RealUnit (Definite interactiveSessionUnitId)
 
 -- | This is the package Id for the current program.  It is the default
 -- package Id if you don't specify a package name.  We don't add this prefix
@@ -683,17 +683,6 @@ the WiringMap, and that's why 'wiredInUnitIds' no longer includes
 -- themselves, however, one should use not 'IsBoot' or conflate signatures and
 -- modules in opposition to boot interfaces. Instead, one should use
 -- 'DriverPhases.HscSource'. See Note [HscSource types].
-
-instance Binary IsBootInterface where
-  put_ bh ib = put_ bh $
-    case ib of
-      NotBoot -> False
-      IsBoot -> True
-  get bh = do
-    b <- get bh
-    return $ case b of
-      False -> NotBoot
-      True -> IsBoot
 
 -- | This data type just pairs a value 'mod' with an IsBootInterface flag. In
 -- practice, 'mod' is usually a @Module@ or @ModuleName@'.

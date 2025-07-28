@@ -26,6 +26,7 @@ import Utilities
 import GHC.Toolchain as Toolchain hiding (HsCpp(HsCpp))
 import GHC.Toolchain.Program
 import GHC.Platform.ArchOS
+import Settings.Program (ghcWithInterpreter)
 
 -- | Track this file to rebuild generated files whenever it changes.
 trackGenerateHs :: Expr ()
@@ -424,7 +425,7 @@ bindistRules = do
     , interpolateSetting "LlvmMinVersion" LlvmMinVersion
     , interpolateVar "LlvmTarget" $ getTarget tgtLlvmTarget
     , interpolateSetting "ProjectVersion" ProjectVersion
-    , interpolateVar "SettingsUseDistroMINGW" $ settingsFileSetting ToolchainSetting_DistroMinGW
+    , interpolateVar "SettingsUseDistroMINGW" $ lookupSystemConfig "settings-use-distro-mingw"
     , interpolateVar "TablesNextToCode" $ yesNo <$> getTarget tgtTablesNextToCode
     , interpolateVar "TargetHasLibm" $ lookupSystemConfig "target-has-libm"
     , interpolateVar "TargetPlatform" $ getTarget targetPlatformTriple
@@ -508,9 +509,9 @@ generateSettings settingsFile = do
         , ("ar flags",            queryTarget arFlags)
         , ("ar supports at file", queryTarget arSupportsAtFile')
         , ("ar supports -L",      queryTarget arSupportsDashL')
-        , ("ranlib command", queryTarget ranlibPath)
-        , ("otool command", expr $ settingsFileSetting ToolchainSetting_OtoolCommand)
-        , ("install_name_tool command", expr $ settingsFileSetting ToolchainSetting_InstallNameToolCommand)
+        , ("ranlib command",      queryTarget ranlibPath)
+        , ("otool command",       queryTarget otoolPath)
+        , ("install_name_tool command", queryTarget installNameToolPath)
         , ("windres command", queryTarget (maybe "/bin/false" prgPath . tgtWindres)) -- TODO: /bin/false is not available on many distributions by default, but we keep it as it were before the ghc-toolchain patch. Fix-me.
         , ("unlit command", ("$topdir/../bin/" <>) <$> expr (programName (ctx { Context.package = unlit })))
         , ("cross compiling", expr $ yesNo <$> flag CrossCompiling)
@@ -525,11 +526,11 @@ generateSettings settingsFile = do
         , ("target has libm", expr $  lookupSystemConfig "target-has-libm")
         , ("Unregisterised", queryTarget (yesNo . tgtUnregisterised))
         , ("LLVM target", queryTarget tgtLlvmTarget)
-        , ("LLVM llc command", expr $ settingsFileSetting ToolchainSetting_LlcCommand)
-        , ("LLVM opt command", expr $ settingsFileSetting ToolchainSetting_OptCommand)
-        , ("LLVM llvm-as command", expr $ settingsFileSetting ToolchainSetting_LlvmAsCommand)
-        , ("LLVM llvm-as flags", expr $ settingsFileSetting ToolchainSetting_LlvmAsFlags)
-        , ("Use inplace MinGW toolchain", expr $ settingsFileSetting ToolchainSetting_DistroMinGW)
+        , ("LLVM llc command", queryTarget llcPath)
+        , ("LLVM opt command", queryTarget optPath)
+        , ("LLVM llvm-as command", queryTarget llvmAsPath)
+        , ("LLVM llvm-as flags", queryTarget llvmAsFlags)
+        , ("Use inplace MinGW toolchain", expr $ lookupSystemConfig "settings-use-distro-mingw")
 
         , ("target RTS linker only supports shared libraries", expr $ yesNo <$> targetRTSLinkerOnlySupportsSharedLibs)
         , ("Use interpreter", expr $ yesNo <$> ghcWithInterpreter (predStage stage))
@@ -571,10 +572,16 @@ generateSettings settingsFile = do
     linkSupportsFilelist        = yesNo . ccLinkSupportsFilelist . tgtCCompilerLink
     linkSupportsCompactUnwind   = yesNo . ccLinkSupportsCompactUnwind . tgtCCompilerLink
     linkIsGnu                   = yesNo . ccLinkIsGnu . tgtCCompilerLink
+    llcPath = maybe "" prgPath . tgtLlc
+    optPath = maybe "" prgPath . tgtOpt
+    llvmAsPath = maybe "" prgPath . tgtLlvmAs
+    llvmAsFlags = escapeArgs . maybe [] prgFlags . tgtLlvmAs
     arPath  = prgPath . arMkArchive . tgtAr
     arFlags = escapeArgs . prgFlags . arMkArchive . tgtAr
     arSupportsAtFile' = yesNo . arSupportsAtFile . tgtAr
     arSupportsDashL' = yesNo . arSupportsDashL . tgtAr
+    otoolPath = maybe "" prgPath . tgtOtool
+    installNameToolPath = maybe "" prgPath . tgtInstallNameTool
     ranlibPath  = maybe "" (prgPath . ranlibProgram) . tgtRanlib
     mergeObjsSupportsResponseFiles' = maybe "NO" (yesNo . mergeObjsSupportsResponseFiles) . tgtMergeObjs
 
@@ -601,6 +608,8 @@ generateConfigHs = do
     -- 'pkgUnitId' on 'compiler' (the ghc-library package) to create the
     -- unit-id in both situations.
     cProjectUnitId <- expr . (`pkgUnitId` compiler) =<< getStage
+
+    cGhcInternalUnitId <- expr . (`pkgUnitId` ghcInternal) =<< getStage
     return $ unlines
         [ "module GHC.Settings.Config"
         , "  ( module GHC.Version"
@@ -610,6 +619,7 @@ generateConfigHs = do
         , "  , cBooterVersion"
         , "  , cStage"
         , "  , cProjectUnitId"
+        , "  , cGhcInternalUnitId"
         , "  ) where"
         , ""
         , "import GHC.Prelude.Basic"
@@ -633,6 +643,9 @@ generateConfigHs = do
         , ""
         , "cProjectUnitId :: String"
         , "cProjectUnitId = " ++ show cProjectUnitId
+        , ""
+        , "cGhcInternalUnitId :: String"
+        , "cGhcInternalUnitId = " ++ show cGhcInternalUnitId
         ]
   where
     stageString (Stage0 InTreeLibs) = "1"

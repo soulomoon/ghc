@@ -67,14 +67,13 @@ import GHC.Core.Type
 
 import GHC.Types.Id
 import GHC.Types.Name
-import GHC.Types.Name.Reader ( WithUserRdr(..) )
+import GHC.Types.Name.Reader
 import GHC.Types.SrcLoc
 import GHC.Types.Basic
 import GHC.Types.Error
 
 import GHC.Builtin.Types( multiplicityTy )
 import GHC.Builtin.Names
-import GHC.Builtin.Names.TH( liftStringName, liftName )
 
 import GHC.Driver.DynFlags
 import GHC.Utils.Misc
@@ -82,7 +81,8 @@ import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Panic
 
 import GHC.Data.Maybe
-import Control.Monad
+
+
 
 {- *********************************************************************
 *                                                                      *
@@ -320,6 +320,7 @@ splitHsApps e = go e (top_ctxt 0 e) []
         ctxt' = case splice of
             HsUntypedSpliceExpr _ (L l _) -> set l ctxt -- l :: SrcAnn AnnListItem
             HsQuasiQuote _ _ (L l _)      -> set l ctxt -- l :: SrcAnn NoEpAnns
+            (XUntypedSplice (HsImplicitLiftSplice _ _ _ (L l _))) -> set l ctxt
 
     -- See Note [Looking through ExpandedThingRn]
     go (XExpr (ExpandedThingRn o e)) ctxt args
@@ -912,8 +913,7 @@ suppressing them entirely if RequiredTypeArguments is in effect.
 
 check_local_id :: Id -> TcM ()
 check_local_id id
-  = do { checkThLocalId id
-       ; tcEmitBindingUsage $ singleUsageUE id }
+  = do { tcEmitBindingUsage $ singleUsageUE id }
 
 check_naughty :: OccName -> TcId -> TcM ()
 check_naughty lbl id
@@ -945,7 +945,7 @@ tcInferDataCon con
                 -- in GHC.Core.DataCon.
 
        ; return ( XExpr (ConLikeTc (RealDataCon con) tvs all_arg_tys)
-                , mkInvisForAllTys tvbs $ mkPhiTy full_theta $
+                , mkForAllTys tvbs $ mkPhiTy full_theta $
                   mkScaledFunTys scaled_arg_tys res ) }
   where
     linear_to_poly :: Scaled Type -> TcM (Scaled Type)
@@ -1067,80 +1067,6 @@ Wrinkles
 ************************************************************************
 -}
 
-checkThLocalId :: Id -> TcM ()
--- The renamer has already done checkWellStaged,
---   in RnSplice.checkThLocalName, so don't repeat that here.
--- Here we just add constraints for cross-stage lifting
-checkThLocalId id
-  = do  { mb_local_use <- getStageAndBindLevel (idName id)
-        ; case mb_local_use of
-             Just (top_lvl, bind_lvl, use_stage)
-                | thLevel use_stage > bind_lvl
-                -> checkCrossStageLifting top_lvl id use_stage
-             _  -> return ()   -- Not a locally-bound thing, or
-                               -- no cross-stage link
-    }
-
---------------------------------------
-checkCrossStageLifting :: TopLevelFlag -> Id -> ThStage -> TcM ()
--- If we are inside typed brackets, and (use_lvl > bind_lvl)
--- we must check whether there's a cross-stage lift to do
--- Examples   \x -> [|| x ||]
---            [|| map ||]
---
--- This is similar to checkCrossStageLifting in GHC.Rename.Splice, but
--- this code is applied to *typed* brackets.
-
-checkCrossStageLifting top_lvl id (Brack _ (TcPending ps_var lie_var q))
-  | isTopLevel top_lvl
-  = when (isExternalName id_name) (keepAlive id_name)
-    -- See Note [Keeping things alive for Template Haskell] in GHC.Rename.Splice
-
-  | otherwise
-  =     -- Nested identifiers, such as 'x' in
-        -- E.g. \x -> [|| h x ||]
-        -- We must behave as if the reference to x was
-        --      h $(lift x)
-        -- We use 'x' itself as the splice proxy, used by
-        -- the desugarer to stitch it all back together.
-        -- If 'x' occurs many times we may get many identical
-        -- bindings of the same splice proxy, but that doesn't
-        -- matter, although it's a mite untidy.
-    do  { let id_ty = idType id
-        ; checkTc (isTauTy id_ty) $
-          TcRnTHError $ TypedTHError $ SplicePolymorphicLocalVar id
-               -- If x is polymorphic, its occurrence sites might
-               -- have different instantiations, so we can't use plain
-               -- 'x' as the splice proxy name.  I don't know how to
-               -- solve this, and it's probably unimportant, so I'm
-               -- just going to flag an error for now
-
-        ; lift <- if isStringTy id_ty then
-                     do { sid <- tcLookupId GHC.Builtin.Names.TH.liftStringName
-                                     -- See Note [Lifting strings]
-                        ; return (mkHsVar (noLocA sid)) }
-                  else
-                     setConstraintVar lie_var   $
-                          -- Put the 'lift' constraint into the right LIE
-                     newMethodFromName (OccurrenceOf id_name)
-                                       GHC.Builtin.Names.TH.liftName
-                                       [getRuntimeRep id_ty, id_ty]
-
-                   -- Warning for implicit lift (#17804)
-        ; addDetailedDiagnostic (TcRnImplicitLift $ idName id)
-
-                   -- Update the pending splices
-        ; ps <- readMutVar ps_var
-        ; let pending_splice = PendingTcSplice id_name
-                                 (nlHsApp (mkLHsWrap (applyQuoteWrapper q) (noLocA lift))
-                                          (nlHsVar id))
-        ; writeMutVar ps_var (pending_splice : ps)
-
-        ; return () }
-  where
-    id_name = idName id
-
-checkCrossStageLifting _ _ _ = return ()
 
 {-
 Note [Lifting strings]
@@ -1160,6 +1086,35 @@ Note [Local record selectors]
 Record selectors for TyCons in this module are ordinary local bindings,
 which show up as ATcIds rather than AGlobals.  So we need to check for
 naughtiness in both branches.  c.f. GHC.Tc.TyCl.Utils.mkRecSelBinds.
+
+Note [Explicit Level Imports]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+This is the overview note which explains the whole implementation of ExplicitLevelImports
+
+GHC Proposal: https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0682-explicit-level-imports.rst
+Paper: https://mpickering.github.io/papers/explicit-level-imports.pdf
+
+The feature is turned on by the `ExplicitLevelImports` extension.
+At the source level, the user marks imports with `quote` or `splice` to introduce
+them at level 1 or -1.
+
+The function GHC.Tc.Utils.Monad.getCurrentAndBindLevel. computes the levels
+at which a Name is available:
+  - for top-level Names, this information is stored in its GRE; it is either local
+    (level 0) or imported, in which case the levels it is imported at are stored in the
+    'ImpDeclSpec's for the GRE. The function 'greLevels' retrieves this information.
+  - for locally-bound Names, this information is stored in the ThBindEnv.
+GHC.Rename.Splice.checkCrossLevelLifting checks that levels in user-written programs
+are correct.
+
+Instances are checked by `checkWellLevelledDFun`, which computes the level of an
+instance by calling `checkWellLevelledInstanceWhat`, which sees what is available at by looking at the module graph.
+
+That's it for the main implementation of the feature; the rest is modifications
+to the driver parts of the code to use this information. For example, in downsweep,
+we only enable code generation for modules needed at the runtime stage.
+See Note [-fno-code mode].
+
 -}
 
 

@@ -699,7 +699,7 @@ instance OutputableBndrId p
                   TyVarSig _ tv_bndr -> text "=" <+> ppr tv_bndr
       pp_inj = case mb_inj of
                  Just (L _ (InjectivityAnn _ lhs rhs)) ->
-                   hsep [ vbar, ppr lhs, text "->", hsep (map ppr rhs) ]
+                   hsep [ vbar, ppr lhs, arrow, hsep (map ppr rhs) ]
                  Nothing -> empty
       (pp_where, pp_eqns) = case info of
         ClosedTypeFamily mb_eqns ->
@@ -868,7 +868,7 @@ instance OutputableBndrId p
 instance OutputableBndrId p
        => Outputable (StandaloneKindSig (GhcPass p)) where
   ppr (StandaloneKindSig _ v ki)
-    = text "type" <+> pprPrefixOcc (unLoc v) <+> text "::" <+> ppr ki
+    = text "type" <+> pprPrefixOcc (unLoc v) <+> dcolon <+> ppr ki
 
 pp_condecls :: forall p. OutputableBndrId p => [LConDecl (GhcPass p)] -> SDoc
 pp_condecls cs
@@ -900,11 +900,15 @@ pprConDecl (ConDeclH98 { con_name = L _ con
     ppr_details (RecCon fields)  = pprPrefixOcc con
                                     <+> pprHsConDeclRecFields (unLoc fields)
 
-pprConDecl (ConDeclGADT { con_names = cons, con_bndrs = L _ outer_bndrs
+pprConDecl (ConDeclGADT { con_names = cons
+                        , con_outer_bndrs = L _ outer_bndrs
+                        , con_inner_bndrs = inner_bndrs
                         , con_mb_cxt = mcxt, con_g_args = args
                         , con_res_ty = res_ty, con_doc = doc })
   = pprMaybeWithDoc doc $ ppr_con_names (toList cons) <+> dcolon
-    <+> (sep [pprHsOuterSigTyVarBndrs outer_bndrs <+> pprLHsContext mcxt,
+    <+> (sep [pprHsOuterSigTyVarBndrs outer_bndrs
+                <+> hsep (map pprHsForAllTelescope inner_bndrs)
+                <+> pprLHsContext mcxt,
               sep (ppr_args args ++ [ppr res_ty]) ])
   where
     ppr_args (PrefixConGADT _ args) = map (pprHsConDeclFieldWith (\arr tyDoc -> tyDoc <+> ppr_arr arr)) args

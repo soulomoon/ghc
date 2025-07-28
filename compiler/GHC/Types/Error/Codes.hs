@@ -295,6 +295,7 @@ type family GhcDiagnosticCode c = n | n -> c where
   GhcDiagnosticCode "PsErrUnallowedPragma"                          = 85314
   GhcDiagnosticCode "PsErrImportPostQualified"                      = 87491
   GhcDiagnosticCode "PsErrImportQualifiedTwice"                     = 05661
+  GhcDiagnosticCode "PsErrSpliceOrQuoteTwice"                       = 26105
   GhcDiagnosticCode "PsErrIllegalImportBundleForm"                  = 81284
   GhcDiagnosticCode "PsErrInvalidRuleActivationMarker"              = 50396
   GhcDiagnosticCode "PsErrMissingBlock"                             = 16849
@@ -369,6 +370,7 @@ type family GhcDiagnosticCode c = n | n -> c where
   GhcDiagnosticCode "PsErrTypeSyntaxInPat"                          = 32181
   GhcDiagnosticCode "PsErrSpecExprMultipleTypeAscription"           = 62037
   GhcDiagnosticCode "PsWarnSpecMultipleTypeAscription"              = 73026
+  GhcDiagnosticCode "PsWarnPatternNamespaceSpecifier"               = 68383
 
   -- Driver diagnostic codes
   GhcDiagnosticCode "DriverMissingHomeModules"                      = 32850
@@ -410,7 +412,6 @@ type family GhcDiagnosticCode c = n | n -> c where
   GhcDiagnosticCode "UnsatisfiableError"                            = 22250
   GhcDiagnosticCode "ReportHoleError"                               = 88464
   GhcDiagnosticCode "FixedRuntimeRepError"                          = 55287
-  GhcDiagnosticCode "BlockedEquality"                               = 06200
   GhcDiagnosticCode "ExpectingMoreArguments"                        = 81325
   GhcDiagnosticCode "UnboundImplicitParams"                         = 91416
   GhcDiagnosticCode "AmbiguityPreventsSolvingCt"                    = 78125
@@ -567,7 +568,7 @@ type family GhcDiagnosticCode c = n | n -> c where
   GhcDiagnosticCode "TcRnMatchesHaveDiffNumArgs"                    = 91938
   GhcDiagnosticCode "TcRnCannotBindScopedTyVarInPatSig"             = 46131
   GhcDiagnosticCode "TcRnCannotBindTyVarsInPatBind"                 = 48361
-  GhcDiagnosticCode "TcRnTooManyTyArgsInConPattern"                 = 01629
+  GhcDiagnosticCode "TcRnTooManyTyArgsInConPattern"                 = Outdated 01629
   GhcDiagnosticCode "TcRnMultipleInlinePragmas"                     = 96665
   GhcDiagnosticCode "TcRnUnexpectedPragmas"                         = 88293
   GhcDiagnosticCode "TcRnNonOverloadedSpecialisePragma"             = 35827
@@ -621,9 +622,9 @@ type family GhcDiagnosticCode c = n | n -> c where
   GhcDiagnosticCode "TcRnShadowedTyVarNameInFamResult"              = 99412
   GhcDiagnosticCode "TcRnIncorrectTyVarOnLhsOfInjCond"              = 88333
   GhcDiagnosticCode "TcRnUnknownTyVarsOnRhsOfInjCond"               = 48254
-  GhcDiagnosticCode "TcRnBadlyStaged"                               = 28914
-  GhcDiagnosticCode "TcRnBadlyStagedType"                           = 86357
-  GhcDiagnosticCode "TcRnStageRestriction"                          = 18157
+  GhcDiagnosticCode "TcRnBadlyLevelled"                             = 28914
+  GhcDiagnosticCode "TcRnBadlyLevelledType"                         = 86357
+  GhcDiagnosticCode "TcRnStageRestriction"                          = Outdated 18157
   GhcDiagnosticCode "TcRnTyThingUsedWrong"                          = 10969
   GhcDiagnosticCode "TcRnCannotDefaultKindVar"                      = 79924
   GhcDiagnosticCode "TcRnUninferrableTyVar"                         = 16220
@@ -711,7 +712,7 @@ type family GhcDiagnosticCode c = n | n -> c where
   -- TcRnBadFieldAnnotation/BadFieldAnnotationReason
   GhcDiagnosticCode "LazyFieldsDisabled"                            = 81601
   GhcDiagnosticCode "UnpackWithoutStrictness"                       = 10107
-  GhcDiagnosticCode "BackpackUnpackAbstractType"                    = 40091
+  GhcDiagnosticCode "UnusableUnpackPragma"                          = 40091
 
   -- TcRnRoleValidationFailed/RoleInferenceFailedReason
   GhcDiagnosticCode "TyVarRoleMismatch"                             = 22221
@@ -756,6 +757,8 @@ type family GhcDiagnosticCode c = n | n -> c where
   GhcDiagnosticCode "BadImportNotExported"                          = 61689
   GhcDiagnosticCode "BadImportAvailDataCon"                         = 35373
   GhcDiagnosticCode "BadImportNotExportedSubordinates"              = 10237
+  GhcDiagnosticCode "BadImportNonTypeSubordinates"                  = 51433
+  GhcDiagnosticCode "BadImportNonDataSubordinates"                  = 46557
   GhcDiagnosticCode "BadImportAvailTyCon"                           = 56449
   GhcDiagnosticCode "BadImportAvailVar"                             = 12112
 
@@ -965,7 +968,7 @@ type family GhcDiagnosticCode c = n | n -> c where
   GhcDiagnosticCode "NestedTHBrackets"                              = 59185
   GhcDiagnosticCode "AddTopDeclsUnexpectedDeclarationSplice"        = 17599
   GhcDiagnosticCode "BadImplicitSplice"                             = 25277
-  GhcDiagnosticCode "QuotedNameWrongStage"                          = 57695
+  GhcDiagnosticCode "QuotedNameWrongStage"                          = Outdated 57695
   GhcDiagnosticCode "IllegalStaticFormInSplice"                     = 12219
 
   -- Zonker messages

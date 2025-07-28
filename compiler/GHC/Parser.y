@@ -639,6 +639,8 @@ are the most common patterns, rewritten as regular expressions for clarity:
  'stock'        { L _ ITstock }    -- for DerivingStrategies extension
  'anyclass'     { L _ ITanyclass } -- for DerivingStrategies extension
  'via'          { L _ ITvia }      -- for DerivingStrategies extension
+ 'splice'       { L _ ITsplice }   -- For StagedImports extension
+ 'quote'        { L _ ITquote }    -- For StagedImports extension
 
  'unit'         { L _ ITunit }
  'signature'    { L _ ITsignature }
@@ -1040,8 +1042,9 @@ export  :: { LIE GhcPs }
                                                                      ; anchor = (maybe glR (\loc -> spanAsAnchor . comb2 loc) $1) $2 }
                                                           ; locImpExp <- return (sL span (IEModuleContents ($1, (epTok $2)) $3))
                                                           ; return $ reLoc $ locImpExp } }
-        | maybe_warning_pragma 'pattern' qcon            { let span = (maybe comb2 comb3 $1) $2 $>
-                                                           in reLoc $ sL span $ IEVar $1 (sLLa $2 $> (IEPattern (epTok $2) $3)) Nothing }
+        | maybe_warning_pragma 'pattern' qcon            {% do { warnPatternNamespaceSpecifier (getLoc $2)
+                                                               ; let span = (maybe comb2 comb3 $1) $2 $>
+                                                               ; return $ reLoc $ sL span $ IEVar $1 (sLLa $2 $> (IEPattern (epTok $2) $3)) Nothing } }
         | maybe_warning_pragma 'default' qtycon          {% do { let { span = (maybe comb2 comb3 $1) $2 $> }
                                                           ; locImpExp <- return (sL span (IEThingAbs $1 (sLLa $2 $> (IEDefault (epTok $2) $3)) Nothing))
                                                           ; return $ reLoc $ locImpExp } }
@@ -1078,6 +1081,8 @@ qcname_ext :: { LocatedA ImpExpQcSpec }
         :  qcname                   { sL1a $1 (ImpExpQcName $1) }
         |  'type' oqtycon           {% do { n <- mkTypeImpExp $2
                                           ; return $ sLLa $1 $> (ImpExpQcType (epTok $1) n) }}
+        |  'data' qvarcon           {% do { n <- mkDataImpExp $2
+                                          ; return $ sLLa $1 $> (ImpExpQcData (epTok $1) n) }}
 
 qcname  :: { LocatedN RdrName }  -- Variable or type constructor
         :  qvar                 { $1 } -- Things which look like functions
@@ -1118,28 +1123,33 @@ importdecls_semi
         | {- empty -}           { [] }
 
 importdecl :: { LImportDecl GhcPs }
-        : 'import' maybe_src maybe_safe optqualified maybe_pkg modid optqualified maybeas maybeimpspec
+        : 'import' maybe_src maybe_splice maybe_safe optqualified maybe_pkg modid maybe_splice optqualified maybeas maybeimpspec
                 {% do {
-                  ; let { ; mPreQual = unLoc $4
-                          ; mPostQual = unLoc $7 }
-                  ; checkImportDecl mPreQual mPostQual
+                  ; let { ; mPreQual = $5
+                          ; mPostQual = $9
+                          ; mPreLevel = $3
+                          ; mPostLevel = $8 }
+                  ; (qualSpec, levelSpec) <- checkImportDecl mPreQual mPostQual mPreLevel mPostLevel
                   ; let anns
                          = EpAnnImportDecl
                              { importDeclAnnImport    = epTok $1
                              , importDeclAnnPragma    = fst $ fst $2
-                             , importDeclAnnSafe      = fst $3
-                             , importDeclAnnQualified = fst $ importDeclQualifiedStyle mPreQual mPostQual
-                             , importDeclAnnPackage   = fst $5
-                             , importDeclAnnAs        = fst $8
+                             , importDeclAnnLevel     = fst $ levelSpec
+                             , importDeclAnnSafe      = fst $4
+                             , importDeclAnnQualified = fst $ qualSpec
+                             , importDeclAnnPackage   = fst $6
+                             , importDeclAnnAs        = fst $10
                              }
-                  ; let loc = (comb5 $1 $6 $7 (snd $8) $9);
+                  ; let loc = (comb6 $1 $7 $8 $9 (snd $10) $11);
                   ; fmap reLoc $ acs loc (\loc cs -> L loc $
                       ImportDecl { ideclExt = XImportDeclPass (EpAnn (spanAsAnchor loc) anns cs) (snd $ fst $2) False
-                                  , ideclName = $6, ideclPkgQual = snd $5
-                                  , ideclSource = snd $2, ideclSafe = snd $3
-                                  , ideclQualified = snd $ importDeclQualifiedStyle mPreQual mPostQual
-                                  , ideclAs = unLoc (snd $8)
-                                  , ideclImportList = unLoc $9 })
+                                  , ideclName = $7, ideclPkgQual = snd $6
+                                  , ideclSource = snd $2
+                                  , ideclLevelSpec = snd $ levelSpec
+                                  , ideclSafe = snd $4
+                                  , ideclQualified = snd $ qualSpec
+                                  , ideclAs = unLoc (snd $10)
+                                  , ideclImportList = unLoc $11 })
                   }
                 }
 
@@ -1153,6 +1163,11 @@ maybe_safe :: { (Maybe (EpToken "safe"),Bool) }
         : 'safe'                                { (Just (epTok $1),True) }
         | {- empty -}                           { (Nothing,      False) }
 
+maybe_splice :: { (Maybe EpAnnLevel) }
+        : 'splice'                              { (Just (EpAnnLevelSplice (epTok $1))) }
+        | 'quote'                               { (Just (EpAnnLevelQuote (epTok $1))) }
+        | {- empty -}                           { (Nothing) }
+
 maybe_pkg :: { (Maybe EpaLocation, RawPkgQual) }
         : STRING  {% do { let { pkgFS = getSTRING $1 }
                         ; unless (looksLikePackageName (unpackFS pkgFS)) $
@@ -1161,9 +1176,9 @@ maybe_pkg :: { (Maybe EpaLocation, RawPkgQual) }
                         ; return (Just (glR $1), RawPkgQual (StringLiteral (getSTRINGs $1) pkgFS Nothing)) } }
         | {- empty -}                           { (Nothing,NoRawPkgQual) }
 
-optqualified :: { Located (Maybe (EpToken "qualified")) }
-        : 'qualified'                           { sL1 $1 (Just (epTok $1)) }
-        | {- empty -}                           { noLoc Nothing }
+optqualified :: { Maybe (EpToken "qualified") }
+        : 'qualified'                           { Just (epTok $1) }
+        | {- empty -}                           { Nothing }
 
 maybeas :: { (Maybe (EpToken "as"),Located (Maybe (LocatedA ModuleName))) }
         : 'as' modid                           { (Just (epTok $1)
@@ -1210,7 +1225,8 @@ importlist1 :: { OrdList (LIE GhcPs) }
 import  :: { OrdList (LIE GhcPs) }
         : qcname_ext export_subspec {% fmap (unitOL . reLoc . (sLL $1 $>)) $ mkModuleImpExp Nothing (fst $ unLoc $2) $1 (snd $ unLoc $2) }
         | 'module' modid            {% fmap (unitOL . reLoc) $ return (sLL $1 $> (IEModuleContents (Nothing, (epTok $1)) $2)) }
-        | 'pattern' qcon            { unitOL $ reLoc $ sLL $1 $> $ IEVar Nothing (sLLa $1 $> (IEPattern (epTok $1) $2)) Nothing }
+        | 'pattern' qcon            {% do { warnPatternNamespaceSpecifier (getLoc $1)
+                                          ; return $ unitOL $ reLoc $ sLL $1 $> $ IEVar Nothing (sLLa $1 $> (IEPattern (epTok $1) $2)) Nothing } }
 
 -----------------------------------------------------------------------------
 -- Fixity Declarations
@@ -2820,12 +2836,12 @@ explicit_activation :: { (ActivationAnn, Activation) }  -- In brackets
 
 quasiquote :: { Located (HsUntypedSplice GhcPs) }
         : TH_QUASIQUOTE   { let { loc = getLoc $1
-                                ; ITquasiQuote (quoter, quote, quoteSpan) = unLoc $1
-                                ; quoterId = mkUnqual varName quoter }
+                                ; ITquasiQuote (quoter, quoterSpan, quote, quoteSpan) = unLoc $1
+                                ; quoterId = L (noAnnSrcSpan (mkSrcSpanPs quoterSpan)) (mkUnqual varName quoter) }
                             in sL1 $1 (HsQuasiQuote noExtField quoterId (L (noAnnSrcSpan (mkSrcSpanPs quoteSpan)) quote)) }
         | TH_QQUASIQUOTE  { let { loc = getLoc $1
-                                ; ITqQuasiQuote (qual, quoter, quote, quoteSpan) = unLoc $1
-                                ; quoterId = mkQual varName (qual, quoter) }
+                                ; ITqQuasiQuote (qual, quoter, quoterSpan, quote, quoteSpan) = unLoc $1
+                                ; quoterId = L (noAnnSrcSpan (mkSrcSpanPs quoterSpan)) (mkQual varName (qual, quoter)) }
                             in sL1 $1 (HsQuasiQuote noExtField quoterId (L (noAnnSrcSpan (mkSrcSpanPs quoteSpan)) quote)) }
 
 exp  :: { ECP } : exp_gen(infixexp)  { $1 }
@@ -3176,7 +3192,7 @@ aexp2   :: { ECP }
 
         -- Template Haskell Extension
         | splice_untyped { ECP $ mkHsSplicePV $1 }
-        | splice_typed   { ecpFromExp $ fmap (uncurry HsTypedSplice) (reLoc $1) }
+        | splice_typed   { ecpFromExp $ fmap (HsTypedSplice noExtField) (reLoc $1) }
 
         | SIMPLEQUOTE  qvar     {% fmap ecpFromExp $ amsA' (sLL $1 $> $ HsUntypedBracket noExtField (VarBr (glR $1) True  $2)) }
         | SIMPLEQUOTE  qcon     {% fmap ecpFromExp $ amsA' (sLL $1 $> $ HsUntypedBracket noExtField (VarBr (glR $1) True  $2)) }
@@ -3215,18 +3231,18 @@ projection
 
 splice_exp :: { LHsExpr GhcPs }
         : splice_untyped { fmap (HsUntypedSplice noExtField) (reLoc $1) }
-        | splice_typed   { fmap (uncurry HsTypedSplice) (reLoc $1) }
+        | splice_typed   { fmap (HsTypedSplice noExtField) (reLoc $1) }
 
 splice_untyped :: { Located (HsUntypedSplice GhcPs) }
         -- See Note [Whitespace-sensitive operator parsing] in GHC.Parser.Lexer
         : PREFIX_DOLLAR aexp2   {% runPV (unECP $2) >>= \ $2 ->
                                    return (sLL $1 $> $ HsUntypedSpliceExpr (epTok $1) $2) }
 
-splice_typed :: { Located (EpToken "$$", LHsExpr GhcPs) }
+splice_typed :: { Located (HsTypedSplice GhcPs) }
         -- See Note [Whitespace-sensitive operator parsing] in GHC.Parser.Lexer
         : PREFIX_DOLLAR_DOLLAR aexp2
                                 {% runPV (unECP $2) >>= \ $2 ->
-                                   return (sLL $1 $> $ (epTok $1, $2)) }
+                                   return (sLL $1 $> $ (HsTypedSpliceExpr (epTok $1) $2)) }
 
 cmdargs :: { [LHsCmdTop GhcPs] }
         : cmdargs acmd                  { $2 : $1 }
@@ -4068,6 +4084,9 @@ special_id
         | 'unit'                { sL1 $1 (fsLit "unit") }
         | 'dependency'          { sL1 $1 (fsLit "dependency") }
         | 'signature'           { sL1 $1 (fsLit "signature") }
+        | 'quote'               { sL1 $1 (fsLit "quote") }
+        | 'splice'              { sL1 $1 (fsLit "splice") }
+
 
 special_sym :: { Located FastString }
 special_sym : '.'       { sL1 $1 (fsLit ".") }
@@ -4325,6 +4344,14 @@ comb5 !a !b !c !d !e =
     combineSrcSpans (getHasLoc b) $
     combineSrcSpans (getHasLoc c) $
     combineSrcSpans (getHasLoc d) (getHasLoc e)
+
+comb6 :: (HasLoc a, HasLoc b, HasLoc c, HasLoc d, HasLoc e, HasLoc f) => a -> b -> c -> d -> e -> f -> SrcSpan
+comb6 !a !b !c !d !e !f =
+    combineSrcSpans (getHasLoc a) $
+    combineSrcSpans (getHasLoc b) $
+    combineSrcSpans (getHasLoc c) $
+    combineSrcSpans (getHasLoc d) $
+    combineSrcSpans (getHasLoc e) (getHasLoc f)
 
 -- strict constructor version:
 {-# INLINE sL #-}

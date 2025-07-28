@@ -1,5 +1,6 @@
 {-# language GADTs, LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+
 module GHC.CmmToAsm.AArch64.CodeGen (
       cmmTopCodeGen
     , generateJumpTableForInstr
@@ -281,7 +282,11 @@ generateJumpTableForInstr config (J_TBL ids (Just lbl) _) =
               )
             where
               blockLabel = blockLbl blockid
-   in Just (CmmData (Section ReadOnlyData lbl) (CmmStaticsRaw lbl jumpTable))
+      sectionType = case platformOS (ncgPlatform config) of
+        -- Aarch64 Windows platform requires LLVM 20 to support .rodata
+        OSMinGW32 -> Text
+        _         -> ReadOnlyData
+   in Just (CmmData (Section sectionType lbl) (CmmStaticsRaw lbl jumpTable))
 generateJumpTableForInstr _ _ = Nothing
 
 -- -----------------------------------------------------------------------------
@@ -923,21 +928,25 @@ getRegister' config plat expr
 
     CmmMachOp (MO_S_Shr w) [x, (CmmLit (CmmInt n _))] | w == W8, 0 <= n, n < 8 -> do
       (reg_x, _format_x, code_x) <- getSomeReg x
-      return $ Any (intFormat w) (\dst -> code_x `snocOL` annExpr expr (SBFX (OpReg w dst) (OpReg w reg_x) (OpImm (ImmInteger n)) (OpImm (ImmInteger (8-n)))))
+      return $ Any (intFormat w) (\dst -> code_x `snocOL` annExpr expr (SBFX (OpReg w dst) (OpReg w reg_x) (OpImm (ImmInteger n)) (OpImm (ImmInteger (8-n))))
+                                                 `snocOL` (UXTB (OpReg w dst) (OpReg w dst))) -- See Note [Signed arithmetic on AArch64]
     CmmMachOp (MO_S_Shr w) [x, y] | w == W8 -> do
       (reg_x, _format_x, code_x) <- getSomeReg x
       (reg_y, _format_y, code_y) <- getSomeReg y
       return $ Any (intFormat w) (\dst -> code_x `appOL` code_y `snocOL` annExpr expr (SXTB (OpReg w reg_x) (OpReg w reg_x)) `snocOL`
-                                                                         (ASR (OpReg w dst) (OpReg w reg_x) (OpReg w reg_y)))
+                                                                         (ASR (OpReg w dst) (OpReg w reg_x) (OpReg w reg_y)) `snocOL`
+                                                                         (UXTB (OpReg w dst) (OpReg w dst))) -- See Note [Signed arithmetic on AArch64]
 
     CmmMachOp (MO_S_Shr w) [x, (CmmLit (CmmInt n _))] | w == W16, 0 <= n, n < 16 -> do
       (reg_x, _format_x, code_x) <- getSomeReg x
-      return $ Any (intFormat w) (\dst -> code_x `snocOL` annExpr expr (SBFX (OpReg w dst) (OpReg w reg_x) (OpImm (ImmInteger n)) (OpImm (ImmInteger (16-n)))))
+      return $ Any (intFormat w) (\dst -> code_x `snocOL` annExpr expr (SBFX (OpReg w dst) (OpReg w reg_x) (OpImm (ImmInteger n)) (OpImm (ImmInteger (16-n))))
+                                                 `snocOL` (UXTH (OpReg w dst) (OpReg w dst))) -- See Note [Signed arithmetic on AArch64]
     CmmMachOp (MO_S_Shr w) [x, y] | w == W16 -> do
       (reg_x, _format_x, code_x) <- getSomeReg x
       (reg_y, _format_y, code_y) <- getSomeReg y
       return $ Any (intFormat w) (\dst -> code_x `appOL` code_y `snocOL` annExpr expr (SXTH (OpReg w reg_x) (OpReg w reg_x)) `snocOL`
-                                                                         (ASR (OpReg w dst) (OpReg w reg_x) (OpReg w reg_y)))
+                                                                         (ASR (OpReg w dst) (OpReg w reg_x) (OpReg w reg_y)) `snocOL`
+                                                                         (UXTH (OpReg w dst) (OpReg w dst))) -- See Note [Signed arithmetic on AArch64]
 
     CmmMachOp (MO_S_Shr w) [x, (CmmLit (CmmInt n _))]
       | w == W32 || w == W64

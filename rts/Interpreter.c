@@ -178,22 +178,34 @@ See also Note [Width of parameters] for some more motivation.
 #define Sp_plusB(n)  ((void *)((StgWord8*)Sp + (ptrdiff_t)(n)))
 #define Sp_minusB(n) ((void *)((StgWord8*)Sp - (ptrdiff_t)(n)))
 
-#define Sp_plusW(n)  (Sp_plusB((ptrdiff_t)(n) * (ptrdiff_t)sizeof(W_)))
-#define Sp_minusW(n) (Sp_minusB((ptrdiff_t)(n) * (ptrdiff_t)sizeof(W_)))
+#define Sp_plusW(n)    ((void*)Sp_plusB((ptrdiff_t)(n) * (ptrdiff_t)sizeof(W_)))
+#define Sp_plusW64(n)  ((void*)Sp_plusB((ptrdiff_t)(n) * (ptrdiff_t)sizeof(StgWord64)))
+#define Sp_minusW(n)   ((void*)Sp_minusB((ptrdiff_t)(n) * (ptrdiff_t)sizeof(W_)))
 
 #define Sp_addB(n)   (Sp = Sp_plusB(n))
 #define Sp_subB(n)   (Sp = Sp_minusB(n))
 #define Sp_addW(n)   (Sp = Sp_plusW(n))
+#define Sp_addW64(n) (Sp = Sp_plusW64(n))
 #define Sp_subW(n)   (Sp = Sp_minusW(n))
 
-#define SpW(n)       (*(StgWord*)(Sp_plusW(n)))
-#define SpB(n)       (*(StgWord*)(Sp_plusB(n)))
+// Assumes stack location is within stack chunk bounds
+#define SpW(n)      (*(StgWord*)(Sp_plusW(n)))
+#define SpW64(n)    (*(StgWord*)(Sp_plusW64(n)))
 
-#define WITHIN_CAP_CHUNK_BOUNDS(n)  WITHIN_CHUNK_BOUNDS(n, cap->r.rCurrentTSO->stackobj)
+#define WITHIN_CAP_CHUNK_BOUNDS_W(n)  WITHIN_CHUNK_BOUNDS_W(n, cap->r.rCurrentTSO->stackobj)
 
-#define WITHIN_CHUNK_BOUNDS(n, s)  \
-  (RTS_LIKELY((StgWord*)(Sp_plusW(n)) < ((s)->stack + (s)->stack_size - sizeofW(StgUnderflowFrame))))
+#define WITHIN_CHUNK_BOUNDS_W(n, s)  \
+    (RTS_LIKELY(((StgWord*) Sp_plusW(n)) < ((s)->stack + (s)->stack_size - sizeofW(StgUnderflowFrame))))
 
+
+#define W64_TO_WDS(n) ((n * sizeof(StgWord64) / sizeof(StgWord)))
+
+// Always safe to use - Return the value at the address
+#define ReadSpW(n)       (*((StgWord*)   SafeSpWP(n)))
+//Argument is offset in multiples of word64
+#define ReadSpW64(n)     (*((StgWord64*) SafeSpWP(W64_TO_WDS(n))))
+// Perhaps confusingly this still reads a full word, merely the offset is in bytes.
+#define ReadSpB(n)       (*((StgWord*)   SafeSpBP(n)))
 
 /* Note [PUSH_L underflow]
    ~~~~~~~~~~~~~~~~~~~~~~~
@@ -203,21 +215,21 @@ PUSH_L instruction.
 
 |---------|
 |  BCO_1  | -<-┐
-|---------|
+|---------|    |
  .........     |
 |---------|    | PUSH_L <n>
 |  BCO_N  | ->-┘
 |---------|
 
 Here BCO_N is syntactically nested within the code for BCO_1 and will result
-in code that references the prior stack frame of BCO_1 for some of it's local
+in code that references the prior stack frame of BCO_1 for some of its local
 variables. If a stack overflow happens between the creation of the stack frame
 for BCO_1 and BCO_N the RTS might move BCO_N to a new stack chunk while leaving
 BCO_1 in place, invalidating a simple offset based reference to the outer stack
 frames.
-Therefore `ReadSpW` first performs a bounds check to ensure that accesses onto
+Therefore `SafeSpW` first performs a bounds check to ensure that accesses onto
 the stack will succeed. If the target address would not be a valid location for
-the current stack chunk then `slow_spw` function is called, which dereferences
+the current stack chunk then `slow_sp` function is called, which dereferences
 the underflow frame to adjust the offset before performing the lookup.
 
                ┌->--x   |  CHK_1  |
@@ -229,13 +241,42 @@ the underflow frame to adjust the offset before performing the lookup.
 |---------|    | PUSH_L <n>
 |  BCO_ N | ->-┘
 |---------|
+
+To keep things simpler all accesses to the stack which might go beyond the stack
+chunk go through one of the ReadSP* or SafeSP* macros.
+When writing to the stack there is no need for checks, we ensured we have space
+in the current chunk ahead of time. So there we use SpW and it's variants which
+omit the stack bounds check.
+
 See ticket #25750
 
 */
 
-#define ReadSpW(n)      \
-  ((WITHIN_CAP_CHUNK_BOUNDS(n)) ? SpW(n): slow_spw(Sp, cap->r.rCurrentTSO->stackobj, n))
+// Returns a pointer to the stack location.
+#define SafeSpWP(n)      \
+  ( ((WITHIN_CAP_CHUNK_BOUNDS_W(n)) ? Sp_plusW(n) : slow_spw(Sp, cap->r.rCurrentTSO->stackobj, n)))
+#define SafeSpBP(off_w)      \
+  ( (WITHIN_CAP_CHUNK_BOUNDS_W((1+(off_w))/sizeof(StgWord))) ? \
+        Sp_plusB(off_w) : \
+        (void*)((ptrdiff_t)((ptrdiff_t)(off_w) % (ptrdiff_t)sizeof(StgWord)) + (StgWord8*)slow_spw(Sp, cap->r.rCurrentTSO->stackobj, (off_w)/sizeof(StgWord))) \
+    )
 
+
+
+/* Note [Interpreter subword primops]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In general the interpreter stack is host-platform word aligned.
+We keep with this convention when evaluating primops for simplicity.
+
+This means:
+
+* All arguments are pushed extended to word size.
+* Results are written to the stack extended to word size.
+
+The only exception are constructor allocations where we push unaligned subwords
+on the stack which are cleaned up by the PACK instruction afterwards.
+
+*/
 
 STATIC_INLINE StgPtr
 allocate_NONUPD (Capability *cap, int n_words)
@@ -243,8 +284,93 @@ allocate_NONUPD (Capability *cap, int n_words)
     return allocate(cap, stg_max(sizeofW(StgHeader)+MIN_PAYLOAD_SIZE, n_words));
 }
 
-int rts_stop_next_breakpoint = 0;
 int rts_stop_on_exception = 0;
+
+/* ---------------------------------------------------------------------------
+ * Enabling and disabling global single step mode
+ * ------------------------------------------------------------------------ */
+
+/* A global toggle for single-step mode.
+ * Unlike `TSO_STOP_NEXT_BREAKPOINT`, which sets single-step mode per-thread,
+ * `rts_stop_next_breakpoint` globally enables single-step mode. If enabled, we
+ * will stop at the immediate next breakpoint regardless of what thread it is in. */
+int rts_stop_next_breakpoint = 0;
+
+void rts_enableStopNextBreakpointAll(void)
+{
+  rts_stop_next_breakpoint = 1;
+}
+
+void rts_disableStopNextBreakpointAll(void)
+{
+  rts_stop_next_breakpoint = 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Enabling and disabling per-thread single step mode
+ * ------------------------------------------------------------------------ */
+
+void rts_enableStopNextBreakpoint(StgTSO* tso)
+{
+    tso->flags |= TSO_STOP_NEXT_BREAKPOINT;
+}
+
+void rts_disableStopNextBreakpoint(StgTSO* tso)
+{
+    tso->flags &= ~TSO_STOP_NEXT_BREAKPOINT;
+}
+
+/* ---------------------------------------------------------------------------
+ * Enabling and disabling per-thread step-out mode
+ * ------------------------------------------------------------------------ */
+
+void rts_enableStopAfterReturn(StgTSO* tso)
+{
+  tso->flags |= TSO_STOP_AFTER_RETURN;
+}
+
+void rts_disableStopAfterReturn(StgTSO* tso)
+{
+  tso->flags &= ~TSO_STOP_AFTER_RETURN;
+}
+
+/*
+Note [Debugger: Step-out]
+~~~~~~~~~~~~~~~~~~~~~~~~~
+When the per-thread debugger step-out flag is set (`TSO_STOP_AFTER_RETURN`),
+the interpreter must guarantee we stop when the current BCO returns to the
+continuation (represented by the first RET_BCO frame after the current frame on
+the stack). Those are the interpreter step-out semantics: stop after returning
+to the continuation.
+
+To achieve this, when the flag is set as the interpreter is re-entered:
+  (1) Traverse the stack until a RET_BCO frame is found or we otherwise hit the
+      bottom (STOP_FRAME).
+  (2) Look for a breakpoint instruction heading the BCO instructions (a
+      breakpoint, when present, is always the first instruction in a BCO)
+
+      (2a) For PUSH_ALT BCOs, the breakpoint instruction will be BRK_ALTS
+          (as explained in Note [Debugger: BRK_ALTS]) and it can be enabled by
+          setting its first operand to 1.
+
+      (2b) Otherwise, the instruction will be BRK_FUN and the breakpoint can be
+           enabled by setting the associated BreakArray at the associated tick
+           index to 0.
+
+By simply enabling the breakpoint heading the continuation we can ensure that
+when it is returned to we will stop there without additional work -- it
+leverages the existing break point insertion process and stopping mechanisms.
+
+See Note [Debugger: Filtering step-out stops] for details on how the
+interpreter further filters the continuation we stop at to make sure we onky
+break on a continuation outside of the function from which step-out was
+initiated.
+
+A limitation of this approach is that stepping-out of a function that was
+tail-called will skip its caller since no stack frame is pushed for a tail
+call (i.e. a tail call returns directly to its caller's first non-tail caller).
+*/
+/* -------------------------------------------------------------------------- */
 
 #if defined(INTERP_STATS)
 
@@ -392,11 +518,12 @@ StgClosure * copyPAP  (Capability *cap, StgPAP *oldpap)
 
 // See Note [PUSH_L underflow] for in which situations this
 // slow lookup is needed
-static StgWord
-slow_spw(void *Sp, StgStack *cur_stack, StgWord offset){
-  // 1. If in range, access the item from the current stack chunk
-  if (WITHIN_CHUNK_BOUNDS(offset, cur_stack)) {
-    return SpW(offset);
+// Returns a pointer to the stack location.
+static void*
+slow_spw(void *Sp, StgStack *cur_stack, StgWord offset_words){
+  // 1. If in range, simply return ptr+offset_words pointing into the current stack chunk
+  if (WITHIN_CHUNK_BOUNDS_W(offset_words, cur_stack)) {
+    return Sp_plusW(offset_words);
   }
   // 2. Not in this stack chunk, so access the underflow frame.
   else {
@@ -420,21 +547,19 @@ slow_spw(void *Sp, StgStack *cur_stack, StgWord offset){
 
       // How many words were on the stack
       stackWords = (StgWord *)frame - (StgWord *) Sp;
-      ASSERT(offset > stackWords);
+      ASSERT(offset_words > stackWords);
 
       // Recursive, in the very unlikely case we have to traverse two
       // stack chunks.
-      return slow_spw(new_stack->sp, new_stack, offset-stackWords);
+      return slow_spw(new_stack->sp, new_stack, offset_words-stackWords);
     }
     // 2b. Access the element if there is no underflow frame, it must be right
     // at the top of the stack.
     else {
         // Not actually in the underflow case
-        return SpW(offset);
+        return Sp_plusW(offset_words);
     }
-
   }
-
 }
 
 // Compute the pointer tag for the constructor and tag the pointer;
@@ -486,6 +611,71 @@ interpretBCO (Capability* cap)
              debugBelch("\n\n");
             );
 
+    /* If the "step-out" flag is set for this thread, find the *continuation*
+     * BCO on the stack and activate its breakpoint specifically. Be careful to
+     * use SafeSp macros to handle stack underflows.
+     *
+     * See Note [Debugger: Step-out]
+     */
+    if (cap->r.rCurrentTSO->flags & TSO_STOP_AFTER_RETURN) {
+
+      StgBCO* bco;
+      StgWord16* bco_instrs;
+      StgHalfWord type;
+
+      /* Store the entry Sp; traverse the stack modifying Sp (using Sp macros);
+       * restore Sp afterwards. */
+      StgPtr restoreStackPointer = Sp;
+
+      /* The first BCO on the stack is the one we are already stopped at.
+       * Skip it. */
+      Sp = SafeSpWP(stack_frame_sizeW((StgClosure *)Sp));
+
+      /* Traverse upwards until continuation BCO, or the end */
+      while ((type = get_itbl((StgClosure*)Sp)->type) != RET_BCO
+                                             && type  != STOP_FRAME) {
+        Sp = SafeSpWP(stack_frame_sizeW((StgClosure *)Sp));
+      }
+
+      ASSERT(type == RET_BCO || type == STOP_FRAME);
+      if (type == RET_BCO) {
+
+        bco = (StgBCO*)(SpW(1)); // BCO is first arg of a RET_BCO
+        ASSERT(get_itbl((StgClosure*)bco)->type == BCO);
+        bco_instrs = (StgWord16*)(bco->instrs->payload);
+
+        /* A breakpoint instruction (BRK_FUN or BRK_ALTS) is always the first
+         * instruction in a BCO */
+        if ((bco_instrs[0] & 0xFF) == bci_BRK_FUN) {
+            int brk_array, tick_index;
+            StgArrBytes *breakPoints;
+            StgPtr* ptrs;
+
+            ptrs = (StgPtr*)(&bco->ptrs->payload[0]);
+            brk_array  = bco_instrs[1];
+            tick_index = bco_instrs[6];
+
+            breakPoints = (StgArrBytes *) BCO_PTR(brk_array);
+            // ACTIVATE the breakpoint by tick index
+            ((StgInt*)breakPoints->payload)[tick_index] = 0;
+        }
+        else if ((bco_instrs[0] & 0xFF) == bci_BRK_ALTS) {
+            // ACTIVATE BRK_ALTS by setting its only argument to ON
+            bco_instrs[1] = 1;
+        }
+        // else: if there is no BRK instruction perhaps we should keep
+        // traversing; that said, the continuation should always have a BRK
+      }
+      else /* type == STOP_FRAME */ {
+        /* No continuation frame to further stop at: Nothing to do */
+      }
+
+      // Mark as done to not do it again
+      cap->r.rCurrentTSO->flags &= ~TSO_STOP_AFTER_RETURN;
+
+      Sp = restoreStackPointer;
+    }
+
     // ------------------------------------------------------------------------
     // Case 1:
     //
@@ -508,14 +698,33 @@ interpretBCO (Capability* cap)
     //
     //       We have a BCO application to perform.  Stack looks like:
     //
-    //          |     ....      |
-    //          +---------------+
-    //          |     arg1      |
-    //          +---------------+
-    //          |     BCO       |
-    //          +---------------+
-    //       Sp |   RET_BCO     |
-    //          +---------------+
+    //
+    //                                       (an StgBCO)
+    //                                    +---> +--------------+
+    //                                    |     | stg_BCO_info | ------+
+    //                                    |     +--------------+       |
+    //                                    |     | StgArrBytes* | <--- the byte code
+    //          |       ...        |      |     +--------------+       |
+    //          +------------------+      |     |     ...      |       |
+    //          |       fvs1       |      |                            |
+    //          +------------------+      |                            |
+    //          |       ...        |      |        (StgInfoTable)      |
+    //          +------------------+      |           +----------+ <---+
+    //          |      args1       |      |           |    ...   |
+    //          +------------------+      |           +----------+
+    //          |   some StgBCO*   | -----+           | type=BCO |
+    //          +------------------+                  +----------+
+    //       Sp | stg_apply_interp | -----+           |   ...    |
+    //          +------------------+      |
+    //                                    |
+    //                                    |   (StgInfoTable)
+    //                                    +----> +--------------+
+    //                                           |     ...      |
+    //                                           +--------------+
+    //                                           | type=RET_BCO |
+    //                                           +--------------+
+    //                                           |     ...      |
+    //
     //
     else if (SpW(0) == (W_)&stg_apply_interp_info) {
         obj = UNTAG_CLOSURE((StgClosure *)ReadSpW(1));
@@ -883,7 +1092,7 @@ do_return_nonpointer:
         // get the offset of the header of the next stack frame
         offset = stack_frame_sizeW((StgClosure *)Sp);
 
-        switch (get_itbl((StgClosure*)(Sp_plusW(offset)))->type) {
+        switch (get_itbl((StgClosure*)(SafeSpWP(offset)))->type) {
 
         case RET_BCO:
             // Returning to an interpreted continuation: pop the return frame
@@ -1236,21 +1445,21 @@ run_BCO:
 #endif
 
         bci = BCO_NEXT;
-    /* We use the high 8 bits for flags, only the highest of which is
-     * currently allocated */
-    ASSERT((bci & 0xFF00) == (bci & 0x8000));
+    /* We use the high 8 bits for flags. The highest of which is
+     * currently allocated to LARGE_ARGS */
+    ASSERT((bci & 0xFF00) == (bci & ( bci_FLAG_LARGE_ARGS )));
 
     switch (bci & 0xFF) {
 
         /* check for a breakpoint on the beginning of a let binding */
         case bci_BRK_FUN:
         {
-            int arg1_brk_array, arg2_tick_mod, arg3_info_mod, arg4_tick_index, arg5_info_index;
+            int arg1_brk_array, arg2_tick_mod, arg3_info_mod, arg4_tick_mod_id, arg5_info_mod_id, arg6_tick_index, arg7_info_index;
 #if defined(PROFILING)
-            int arg6_cc;
+            int arg8_cc;
 #endif
             StgArrBytes *breakPoints;
-            int returning_from_break;
+            int returning_from_break, stop_next_breakpoint;
 
             // the io action to run at a breakpoint
             StgClosure *ioAction;
@@ -1264,10 +1473,12 @@ run_BCO:
             arg1_brk_array      = BCO_GET_LARGE_ARG;
             arg2_tick_mod       = BCO_GET_LARGE_ARG;
             arg3_info_mod       = BCO_GET_LARGE_ARG;
-            arg4_tick_index     = BCO_NEXT;
-            arg5_info_index     = BCO_NEXT;
+            arg4_tick_mod_id    = BCO_GET_LARGE_ARG;
+            arg5_info_mod_id    = BCO_GET_LARGE_ARG;
+            arg6_tick_index     = BCO_NEXT;
+            arg7_info_index     = BCO_NEXT;
 #if defined(PROFILING)
-            arg6_cc             = BCO_GET_LARGE_ARG;
+            arg8_cc             = BCO_GET_LARGE_ARG;
 #else
             BCO_GET_LARGE_ARG;
 #endif
@@ -1278,9 +1489,16 @@ run_BCO:
             returning_from_break =
                 cap->r.rCurrentTSO->flags & TSO_STOPPED_ON_BREAKPOINT;
 
+            // check whether this thread is set to stop at the immediate next
+            // breakpoint -- either by the global `rts_stop_next_breakpoint`
+            // flag, or by the local `TSO_STOP_NEXT_BREAKPOINT`
+            stop_next_breakpoint =
+              rts_stop_next_breakpoint ||
+                cap->r.rCurrentTSO->flags & TSO_STOP_NEXT_BREAKPOINT;
+
 #if defined(PROFILING)
             cap->r.rCCCS = pushCostCentre(cap->r.rCCCS,
-                                          (CostCentre*)BCO_LIT(arg6_cc));
+                                          (CostCentre*)BCO_LIT(arg8_cc));
 #endif
 
             // if we are returning from a break then skip this section
@@ -1289,20 +1507,20 @@ run_BCO:
             {
                breakPoints = (StgArrBytes *) BCO_PTR(arg1_brk_array);
 
-               // stop the current thread if either the
-               // "rts_stop_next_breakpoint" flag is true OR if the
-               // ignore count for this particular breakpoint is zero
-               StgInt ignore_count = ((StgInt*)breakPoints->payload)[arg4_tick_index];
-               if (rts_stop_next_breakpoint == false && ignore_count > 0)
+               // stop the current thread if either `stop_next_breakpoint` is
+               // true OR if the ignore count for this particular breakpoint is zero
+               StgInt ignore_count = ((StgInt*)breakPoints->payload)[arg6_tick_index];
+               if (stop_next_breakpoint == false && ignore_count > 0)
                {
                   // decrement and write back ignore count
-                  ((StgInt*)breakPoints->payload)[arg4_tick_index] = --ignore_count;
+                  ((StgInt*)breakPoints->payload)[arg6_tick_index] = --ignore_count;
                }
-               else if (rts_stop_next_breakpoint == true || ignore_count == 0)
+               else if (stop_next_breakpoint == true || ignore_count == 0)
                {
                   // make sure we don't automatically stop at the
                   // next breakpoint
-                  rts_stop_next_breakpoint = false;
+                  rts_stop_next_breakpoint = 0;
+                  cap->r.rCurrentTSO->flags &= ~TSO_STOP_NEXT_BREAKPOINT;
 
                   // allocate memory for a new AP_STACK, enough to
                   // store the top stack frame plus an
@@ -1330,8 +1548,10 @@ run_BCO:
                   // continue execution of this BCO when the IO action returns.
                   //
                   // ioAction :: Addr#       -- the breakpoint tick module
+                  //          -> Addr#       -- the breakpoint tick module unit id
                   //          -> Int#        -- the breakpoint tick index
                   //          -> Addr#       -- the breakpoint info module
+                  //          -> Addr#       -- the breakpoint info module unit id
                   //          -> Int#        -- the breakpoint info index
                   //          -> Bool        -- exception?
                   //          -> HValue      -- the AP_STACK, or exception
@@ -1340,17 +1560,21 @@ run_BCO:
                   ioAction = (StgClosure *) deRefStablePtr (
                       rts_breakpoint_io_action);
 
-                  Sp_subW(15);
-                  SpW(14) = (W_)obj;
-                  SpW(13) = (W_)&stg_apply_interp_info;
-                  SpW(12) = (W_)new_aps;
-                  SpW(11) = (W_)False_closure;         // True <=> an exception
-                  SpW(10) = (W_)&stg_ap_ppv_info;
-                  SpW(9)  = (W_)arg5_info_index;
+                  Sp_subW(19);
+                  SpW(18) = (W_)obj;
+                  SpW(17) = (W_)&stg_apply_interp_info;
+                  SpW(16) = (W_)new_aps;
+                  SpW(15) = (W_)False_closure;         // True <=> an exception
+                  SpW(14) = (W_)&stg_ap_ppv_info;
+                  SpW(13)  = (W_)arg7_info_index;
+                  SpW(12)  = (W_)&stg_ap_n_info;
+                  SpW(11)  = (W_)BCO_LIT(arg5_info_mod_id);
+                  SpW(10)  = (W_)&stg_ap_n_info;
+                  SpW(9)  = (W_)BCO_LIT(arg3_info_mod);
                   SpW(8)  = (W_)&stg_ap_n_info;
-                  SpW(7)  = (W_)BCO_LIT(arg3_info_mod);
+                  SpW(7)  = (W_)arg6_tick_index;
                   SpW(6)  = (W_)&stg_ap_n_info;
-                  SpW(5)  = (W_)arg4_tick_index;
+                  SpW(5)  = (W_)BCO_LIT(arg4_tick_mod_id);
                   SpW(4)  = (W_)&stg_ap_n_info;
                   SpW(3)  = (W_)BCO_LIT(arg2_tick_mod);
                   SpW(2)  = (W_)&stg_ap_n_info;
@@ -1374,6 +1598,17 @@ run_BCO:
 
             // continue normal execution of the byte code instructions
             goto nextInsn;
+        }
+
+        /* See Note [Debugger: BRK_ALTS] */
+        case bci_BRK_ALTS:
+        {
+          StgWord16 active = BCO_NEXT;
+          if (active) {
+            cap->r.rCurrentTSO->flags |= TSO_STOP_NEXT_BREAKPOINT;
+          }
+
+          goto nextInsn;
         }
 
         case bci_STKCHECK: {
@@ -1421,41 +1656,41 @@ run_BCO:
         case bci_PUSH8: {
             W_ off = BCO_GET_LARGE_ARG;
             Sp_subB(1);
-            *(StgWord8*)Sp = (StgWord8) *(StgWord*)(Sp_plusB(off+1));
+            *(StgWord8*)Sp = (StgWord8) (ReadSpB(off+1));
             goto nextInsn;
         }
 
         case bci_PUSH16: {
             W_ off = BCO_GET_LARGE_ARG;
             Sp_subB(2);
-            *(StgWord16*)Sp = (StgWord16) *(StgWord*)(Sp_plusB(off+2));
+            *(StgWord16*)Sp = (StgWord16) (ReadSpB(off+2));
             goto nextInsn;
         }
 
         case bci_PUSH32: {
             W_ off = BCO_GET_LARGE_ARG;
             Sp_subB(4);
-            *(StgWord32*)Sp = (StgWord32) *(StgWord*)(Sp_plusB(off+4));
+            *(StgWord32*)Sp = (StgWord32) (ReadSpB(off+4));
             goto nextInsn;
         }
 
         case bci_PUSH8_W: {
             W_ off = BCO_GET_LARGE_ARG;
-            *(StgWord*)(Sp_minusW(1)) = (StgWord) ((StgWord8) *(StgWord*)(Sp_plusB(off)));
+            *(StgWord*)(Sp_minusW(1)) = (StgWord) ((StgWord8) (ReadSpB(off)));
             Sp_subW(1);
             goto nextInsn;
         }
 
         case bci_PUSH16_W: {
             W_ off = BCO_GET_LARGE_ARG;
-            *(StgWord*)(Sp_minusW(1)) = (StgWord) ((StgWord16) *(StgWord*)(Sp_plusB(off)));
+            *(StgWord*)(Sp_minusW(1)) = (StgWord) ((StgWord16) (ReadSpB(off)));
             Sp_subW(1);
             goto nextInsn;
         }
 
         case bci_PUSH32_W: {
             W_ off = BCO_GET_LARGE_ARG;
-            *(StgWord*)(Sp_minusW(1)) = (StgWord) ((StgWord32) *(StgWord*)(Sp_plusB(off)));
+            *(StgWord*)(Sp_minusW(1)) = (StgWord) ((StgWord32) (ReadSpB(off)));
             Sp_subW(1);
             goto nextInsn;
         }
@@ -1469,7 +1704,7 @@ run_BCO:
             // Here we make sure references we push are tagged.
             // See Note [CBV Functions and the interpreter] in Info.hs
 
-            //Safe some memory reads if we already have a tag.
+            //Save some memory reads if we already have a tag.
             if(GET_CLOSURE_TAG(tagged_obj) == 0) {
                 StgClosure *obj = UNTAG_CLOSURE(tagged_obj);
                 switch ( get_itbl(obj)->type ) {
@@ -1945,7 +2180,7 @@ run_BCO:
         case bci_TESTLT_I64: {
             int discr   = BCO_GET_LARGE_ARG;
             int failto  = BCO_GET_LARGE_ARG;
-            StgInt64 stackInt = (*(StgInt64*)Sp);
+            StgInt64 stackInt = ReadSpW64(0);
             if (stackInt >= BCO_LITI64(discr))
                 bciPtr = failto;
             goto nextInsn;
@@ -1991,7 +2226,7 @@ run_BCO:
         case bci_TESTEQ_I64: {
             int discr   = BCO_GET_LARGE_ARG;
             int failto  = BCO_GET_LARGE_ARG;
-            StgInt64 stackInt = (*(StgInt64*)Sp);
+            StgInt64 stackInt = ReadSpW64(0);
             if (stackInt != BCO_LITI64(discr)) {
                 bciPtr = failto;
             }
@@ -2040,7 +2275,7 @@ run_BCO:
         case bci_TESTLT_W64: {
             int discr   = BCO_GET_LARGE_ARG;
             int failto  = BCO_GET_LARGE_ARG;
-            StgWord64 stackWord = (*(StgWord64*)Sp);
+            StgWord64 stackWord = ReadSpW64(0);
             if (stackWord >= BCO_LITW64(discr))
                 bciPtr = failto;
             goto nextInsn;
@@ -2086,7 +2321,7 @@ run_BCO:
         case bci_TESTEQ_W64: {
             int discr   = BCO_GET_LARGE_ARG;
             int failto  = BCO_GET_LARGE_ARG;
-            StgWord64 stackWord = (*(StgWord64*)Sp);
+            StgWord64 stackWord = ReadSpW64(0);
             if (stackWord != BCO_LITW64(discr)) {
                 bciPtr = failto;
             }
@@ -2223,7 +2458,7 @@ run_BCO:
         case bci_SWIZZLE: {
             W_ stkoff = BCO_GET_LARGE_ARG;
             StgInt n = BCO_GET_LARGE_ARG;
-            (*(StgInt*)(Sp_plusW(stkoff))) += n;
+            (*(StgInt*)(SafeSpWP(stkoff))) += n;
             goto nextInsn;
         }
 
@@ -2231,6 +2466,203 @@ run_BCO:
             Sp_subW(1);
             SpW(0) = (W_)&stg_primcall_info;
             RETURN_TO_SCHEDULER_NO_PAUSE(ThreadRunGHC, ThreadYielding);
+        }
+
+// op :: ty -> ty
+#define UN_SIZED_OP(op,ty)                                          \
+    {                                                               \
+        if(sizeof(ty) == 8) {                                       \
+            ty r = op ((ty) ReadSpW64(0));                        \
+            SpW64(0) = (StgWord64) r;                               \
+        } else {                                                    \
+            ty r = op ((ty) ReadSpW(0));                          \
+            SpW(0) = (StgWord) r;                                   \
+        }                                                           \
+        goto nextInsn;                                              \
+    }
+
+// op :: ty -> ty -> ty
+#define SIZED_BIN_OP(op,ty)                                                     \
+        {                                                                       \
+            if(sizeof(ty) == 8) {                                               \
+                ty r = ((ty) ReadSpW64(0)) op ((ty) ReadSpW64(1));                  \
+                Sp_addW64(1);                                                   \
+                SpW64(0) = (StgWord64) r;                                       \
+            } else {                                                            \
+                ty r = ((ty) ReadSpW(0)) op ((ty) ReadSpW(1));                  \
+                Sp_addW(1);                                                     \
+                SpW(0) = (StgWord) r;                                           \
+            };                                                                  \
+            goto nextInsn;                                                      \
+        }
+
+// op :: ty -> Int -> ty
+#define SIZED_BIN_OP_TY_INT(op,ty)                                      \
+{                                                                       \
+    if(sizeof(ty) > sizeof(StgWord)) {                                  \
+        ty r = ((ty) ReadSpW64(0)) op ((ty) ReadSpW(2));                \
+        Sp_addW(1);                                                     \
+        SpW64(0) = (StgWord64) r;                                       \
+    } else {                                                            \
+        ty r = ((ty) ReadSpW(0)) op ((ty) ReadSpW(1));                  \
+        Sp_addW(1);                                                     \
+        SpW(0) = (StgWord) r;                                           \
+    };                                                                  \
+    goto nextInsn;                                                      \
+}
+
+// op :: ty -> ty -> Int
+#define SIZED_BIN_OP_TY_TY_INT(op,ty)                                   \
+{                                                                       \
+    if(sizeof(ty) > sizeof(StgWord)) {                                  \
+        ty r = ((ty) ReadSpW64(0)) op ((ty) ReadSpW64(1));              \
+        Sp_addW(3);                                                     \
+        SpW(0) = (StgWord) r;                                       \
+    } else {                                                            \
+        ty r = ((ty) ReadSpW(0)) op ((ty) ReadSpW(1));                  \
+        Sp_addW(1);                                                     \
+        SpW(0) = (StgWord) r;                                           \
+    };                                                                  \
+    goto nextInsn;                                                      \
+}
+
+        case bci_OP_ADD_64: SIZED_BIN_OP(+, StgInt64)
+        case bci_OP_SUB_64: SIZED_BIN_OP(-, StgInt64)
+        case bci_OP_AND_64: SIZED_BIN_OP(&, StgInt64)
+        case bci_OP_XOR_64: SIZED_BIN_OP(^, StgInt64)
+        case bci_OP_OR_64:  SIZED_BIN_OP(|, StgInt64)
+        case bci_OP_MUL_64: SIZED_BIN_OP(*, StgInt64)
+        case bci_OP_SHL_64: SIZED_BIN_OP_TY_INT(<<, StgWord64)
+        case bci_OP_LSR_64: SIZED_BIN_OP_TY_INT(>>, StgWord64)
+        case bci_OP_ASR_64: SIZED_BIN_OP_TY_INT(>>, StgInt64)
+
+        case bci_OP_NEQ_64:  SIZED_BIN_OP_TY_TY_INT(!=, StgWord64)
+        case bci_OP_EQ_64:   SIZED_BIN_OP_TY_TY_INT(==, StgWord64)
+        case bci_OP_U_GT_64: SIZED_BIN_OP_TY_TY_INT(>, StgWord64)
+        case bci_OP_U_GE_64: SIZED_BIN_OP_TY_TY_INT(>=, StgWord64)
+        case bci_OP_U_LT_64: SIZED_BIN_OP_TY_TY_INT(<, StgWord64)
+        case bci_OP_U_LE_64: SIZED_BIN_OP_TY_TY_INT(<=, StgWord64)
+
+        case bci_OP_S_GT_64: SIZED_BIN_OP_TY_TY_INT(>, StgInt64)
+        case bci_OP_S_GE_64: SIZED_BIN_OP_TY_TY_INT(>=, StgInt64)
+        case bci_OP_S_LT_64: SIZED_BIN_OP_TY_TY_INT(<, StgInt64)
+        case bci_OP_S_LE_64: SIZED_BIN_OP_TY_TY_INT(<=, StgInt64)
+
+        case bci_OP_NOT_64: UN_SIZED_OP(~, StgWord64)
+        case bci_OP_NEG_64: UN_SIZED_OP(-, StgInt64)
+
+
+        case bci_OP_ADD_32: SIZED_BIN_OP(+, StgInt32)
+        case bci_OP_SUB_32: SIZED_BIN_OP(-, StgInt32)
+        case bci_OP_AND_32: SIZED_BIN_OP(&, StgInt32)
+        case bci_OP_XOR_32: SIZED_BIN_OP(^, StgInt32)
+        case bci_OP_OR_32:  SIZED_BIN_OP(|, StgInt32)
+        case bci_OP_MUL_32: SIZED_BIN_OP(*, StgInt32)
+        case bci_OP_SHL_32: SIZED_BIN_OP_TY_INT(<<, StgWord32)
+        case bci_OP_LSR_32: SIZED_BIN_OP_TY_INT(>>, StgWord32)
+        case bci_OP_ASR_32: SIZED_BIN_OP_TY_INT(>>, StgInt32)
+
+        case bci_OP_NEQ_32:  SIZED_BIN_OP_TY_TY_INT(!=, StgWord32)
+        case bci_OP_EQ_32:   SIZED_BIN_OP_TY_TY_INT(==, StgWord32)
+        case bci_OP_U_GT_32: SIZED_BIN_OP_TY_TY_INT(>, StgWord32)
+        case bci_OP_U_GE_32: SIZED_BIN_OP_TY_TY_INT(>=, StgWord32)
+        case bci_OP_U_LT_32: SIZED_BIN_OP_TY_TY_INT(<, StgWord32)
+        case bci_OP_U_LE_32: SIZED_BIN_OP_TY_TY_INT(<=, StgWord32)
+
+        case bci_OP_S_GT_32: SIZED_BIN_OP_TY_TY_INT(>, StgInt32)
+        case bci_OP_S_GE_32: SIZED_BIN_OP_TY_TY_INT(>=, StgInt32)
+        case bci_OP_S_LT_32: SIZED_BIN_OP_TY_TY_INT(<, StgInt32)
+        case bci_OP_S_LE_32: SIZED_BIN_OP_TY_TY_INT(<=, StgInt32)
+
+        case bci_OP_NOT_32: UN_SIZED_OP(~, StgWord32)
+        case bci_OP_NEG_32: UN_SIZED_OP(-, StgInt32)
+
+
+        case bci_OP_ADD_16: SIZED_BIN_OP(+, StgInt16)
+        case bci_OP_SUB_16: SIZED_BIN_OP(-, StgInt16)
+        case bci_OP_AND_16: SIZED_BIN_OP(&, StgInt16)
+        case bci_OP_XOR_16: SIZED_BIN_OP(^, StgInt16)
+        case bci_OP_OR_16:  SIZED_BIN_OP(|, StgInt16)
+        case bci_OP_MUL_16: SIZED_BIN_OP(*, StgInt16)
+        case bci_OP_SHL_16: SIZED_BIN_OP_TY_INT(<<, StgWord16)
+        case bci_OP_LSR_16: SIZED_BIN_OP_TY_INT(>>, StgWord16)
+        case bci_OP_ASR_16: SIZED_BIN_OP_TY_INT(>>, StgInt16)
+
+        case bci_OP_NEQ_16:  SIZED_BIN_OP_TY_TY_INT(!=, StgWord16)
+        case bci_OP_EQ_16:   SIZED_BIN_OP_TY_TY_INT(==, StgWord16)
+        case bci_OP_U_GT_16: SIZED_BIN_OP_TY_TY_INT(>, StgWord16)
+        case bci_OP_U_GE_16: SIZED_BIN_OP_TY_TY_INT(>=, StgWord16)
+        case bci_OP_U_LT_16: SIZED_BIN_OP_TY_TY_INT(<, StgWord16)
+        case bci_OP_U_LE_16: SIZED_BIN_OP_TY_TY_INT(<=, StgWord16)
+
+        case bci_OP_S_GT_16: SIZED_BIN_OP(>, StgInt16)
+        case bci_OP_S_GE_16: SIZED_BIN_OP(>=, StgInt16)
+        case bci_OP_S_LT_16: SIZED_BIN_OP(<, StgInt16)
+        case bci_OP_S_LE_16: SIZED_BIN_OP(<=, StgInt16)
+
+        case bci_OP_NOT_16: UN_SIZED_OP(~, StgWord16)
+        case bci_OP_NEG_16: UN_SIZED_OP(-, StgInt16)
+
+
+        case bci_OP_ADD_08: SIZED_BIN_OP(+, StgInt8)
+        case bci_OP_SUB_08: SIZED_BIN_OP(-, StgInt8)
+        case bci_OP_AND_08: SIZED_BIN_OP(&, StgInt8)
+        case bci_OP_XOR_08: SIZED_BIN_OP(^, StgInt8)
+        case bci_OP_OR_08:  SIZED_BIN_OP(|, StgInt8)
+        case bci_OP_MUL_08: SIZED_BIN_OP(*, StgInt8)
+        case bci_OP_SHL_08: SIZED_BIN_OP_TY_INT(<<, StgWord8)
+        case bci_OP_LSR_08: SIZED_BIN_OP_TY_INT(>>, StgWord8)
+        case bci_OP_ASR_08: SIZED_BIN_OP_TY_INT(>>, StgInt8)
+
+        case bci_OP_NEQ_08:  SIZED_BIN_OP_TY_TY_INT(!=, StgWord8)
+        case bci_OP_EQ_08:   SIZED_BIN_OP_TY_TY_INT(==, StgWord8)
+        case bci_OP_U_GT_08: SIZED_BIN_OP_TY_TY_INT(>, StgWord8)
+        case bci_OP_U_GE_08: SIZED_BIN_OP_TY_TY_INT(>=, StgWord8)
+        case bci_OP_U_LT_08: SIZED_BIN_OP_TY_TY_INT(<, StgWord8)
+        case bci_OP_U_LE_08: SIZED_BIN_OP_TY_TY_INT(<=, StgWord8)
+
+        case bci_OP_S_GT_08: SIZED_BIN_OP_TY_TY_INT(>, StgInt8)
+        case bci_OP_S_GE_08: SIZED_BIN_OP_TY_TY_INT(>=, StgInt8)
+        case bci_OP_S_LT_08: SIZED_BIN_OP_TY_TY_INT(<, StgInt8)
+        case bci_OP_S_LE_08: SIZED_BIN_OP_TY_TY_INT(<=, StgInt8)
+
+        case bci_OP_NOT_08: UN_SIZED_OP(~, StgWord8)
+        case bci_OP_NEG_08: UN_SIZED_OP(-, StgInt8)
+
+        case bci_OP_INDEX_ADDR_64:
+        {
+            StgWord64* addr = (StgWord64*) SpW(0);
+            StgInt offset = (StgInt) SpW(1);
+            if(sizeof(StgPtr) == sizeof(StgWord64)) {
+                Sp_addW(1);
+            }
+            SpW64(0) = *(addr+offset);
+            goto nextInsn;
+        }
+
+        case bci_OP_INDEX_ADDR_32:
+        {
+            StgWord32* addr = (StgWord32*) SpW(0);
+            StgInt offset = (StgInt) SpW(1);
+            Sp_addW(1);
+            SpW(0) = (StgWord) *(addr+offset);
+            goto nextInsn;
+        }
+        case bci_OP_INDEX_ADDR_16:
+        {
+            StgWord16* addr = (StgWord16*) SpW(0);
+            StgInt offset = (StgInt) SpW(1);
+            Sp_addW(1);
+            SpW(0) = (StgWord) *(addr+offset);
+            goto nextInsn;
+        }
+        case bci_OP_INDEX_ADDR_08:
+        {
+            StgWord8* addr = (StgWord8*) SpW(0);
+            StgInt offset = (StgInt) SpW(1);
+            Sp_addW(1);
+            SpW(0) = (StgWord) *(addr+offset);
+            goto nextInsn;
         }
 
         case bci_CCALL: {

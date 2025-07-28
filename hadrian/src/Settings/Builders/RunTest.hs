@@ -119,7 +119,7 @@ inTreeCompilerArgs stg = do
 
     os          <- queryHostTarget queryOS
     arch        <- queryTargetTarget queryArch
-    let codegen_arches = ["x86_64", "i386", "powerpc", "powerpc64", "powerpc64le", "aarch64", "wasm32", "riscv64"]
+    let codegen_arches = ["x86_64", "i386", "powerpc", "powerpc64", "powerpc64le", "aarch64", "wasm32", "riscv64", "loongarch64"]
     let withNativeCodeGen
           | unregisterised = False
           | arch `elem` codegen_arches = True
@@ -127,9 +127,9 @@ inTreeCompilerArgs stg = do
     platform    <- queryTargetTarget targetPlatformTriple
     wordsize    <- show @Int . (*8) <$> queryTargetTarget (wordSize2Bytes . tgtWordSize)
 
-    llc_cmd   <- settingsFileSetting ToolchainSetting_LlcCommand
-    llvm_as_cmd <- settingsFileSetting ToolchainSetting_LlvmAsCommand
-    have_llvm <- liftIO (all isJust <$> mapM findExecutable [llc_cmd, llvm_as_cmd])
+    llc_cmd   <- queryTargetTarget tgtLlc
+    llvm_as_cmd <- queryTargetTarget tgtLlvmAs
+    let have_llvm = all isJust [llc_cmd, llvm_as_cmd]
 
     top         <- topDirectory
 

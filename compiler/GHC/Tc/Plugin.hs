@@ -101,7 +101,6 @@ tcPluginIO a = unsafeTcPluginTcM (liftIO a)
 tcPluginTrace :: String -> SDoc -> TcPluginM ()
 tcPluginTrace a b = unsafeTcPluginTcM (traceTc a b)
 
-
 findImportedModule :: ModuleName -> PkgQual -> TcPluginM Finder.FindResult
 findImportedModule mod_name mb_pkg = do
     hsc_env <- getTopEnv
@@ -197,7 +196,7 @@ newEvVar = unsafeTcPluginTcM . TcM.newEvVar
 -- | Create a fresh coercion hole.
 -- This should only be invoked within 'tcPluginSolve'.
 newCoercionHole :: PredType -> TcPluginM CoercionHole
-newCoercionHole = unsafeTcPluginTcM . TcM.newVanillaCoercionHole
+newCoercionHole = unsafeTcPluginTcM . TcM.newCoercionHole
 
 -- | Bind an evidence variable.
 --

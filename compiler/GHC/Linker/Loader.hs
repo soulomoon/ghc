@@ -28,6 +28,7 @@ module GHC.Linker.Loader
    , extendLoadedEnv
    , deleteFromLoadedEnv
    -- * Internals
+   , allocateBreakArrays
    , rmDupLinkables
    , modifyLoaderState
    , initLinkDepsOpts
@@ -52,14 +53,16 @@ import GHC.Driver.Config.Finder
 import GHC.Tc.Utils.Monad
 
 import GHC.Runtime.Interpreter
+import GHCi.BreakArray
 import GHCi.RemoteTypes
 import GHC.Iface.Load
-import GHCi.Message (LoadedDLL)
+import GHCi.Message (ConInfoTable(..), LoadedDLL)
 
 import GHC.ByteCode.Linker
 import GHC.ByteCode.Asm
 import GHC.ByteCode.Types
 
+import GHC.Stack.CCS
 import GHC.SysTools
 
 import GHC.Types.Basic
@@ -95,6 +98,8 @@ import GHC.Linker.Types
 -- Standard libraries
 import Control.Monad
 
+import Data.Array
+import Data.ByteString (ByteString)
 import qualified Data.Set as Set
 import Data.Char (isSpace)
 import qualified Data.Foldable as Foldable
@@ -118,8 +123,8 @@ import System.Win32.Info (getSystemDirectory)
 import GHC.Utils.Exception
 import GHC.Unit.Home.Graph (lookupHug, unitEnv_foldWithKey)
 import GHC.Driver.Downsweep
-
-
+import qualified GHC.Runtime.Interpreter as GHCi
+import Data.Array.Base (numElements)
 
 -- Note [Linkers and loaders]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -178,6 +183,10 @@ emptyLoaderState = LoaderState
    , bcos_loaded = emptyModuleEnv
    , objs_loaded = emptyModuleEnv
    , temp_sos = []
+   , linked_breaks = LinkedBreaks
+     { breakarray_env = emptyModuleEnv
+     , ccs_env        = emptyModuleEnv
+     }
    }
   -- Packages that don't need loading, because the compiler
   -- shares them with the interpreted program.
@@ -688,14 +697,22 @@ loadDecls interp hsc_env span linkable = do
         else do
           -- Link the expression itself
           let le  = linker_env pls
-              le2 = le { itbl_env = foldl' (\acc cbc -> plusNameEnv acc (bc_itbls cbc)) (itbl_env le) cbcs
-                       , addr_env = foldl' (\acc cbc -> plusNameEnv acc (bc_strs cbc)) (addr_env le) cbcs }
+          let lb  = linked_breaks pls
+          le2_itbl_env <- linkITbls interp (itbl_env le) (concat $ map bc_itbls cbcs)
+          le2_addr_env <- foldlM (\env cbc -> allocateTopStrings interp (bc_strs cbc) env) (addr_env le) cbcs
+          le2_breakarray_env <- allocateBreakArrays interp (breakarray_env lb) (catMaybes $ map bc_breaks cbcs)
+          le2_ccs_env        <- allocateCCS         interp (ccs_env lb)        (catMaybes $ map bc_breaks cbcs)
+          let le2 = le { itbl_env = le2_itbl_env
+                       , addr_env = le2_addr_env }
+          let lb2 = lb { breakarray_env = le2_breakarray_env
+                       , ccs_env = le2_ccs_env }
 
           -- Link the necessary packages and linkables
-          new_bindings <- linkSomeBCOs interp (pkgs_loaded pls) le2 cbcs
+          new_bindings <- linkSomeBCOs interp (pkgs_loaded pls) le2 lb2 cbcs
           nms_fhvs <- makeForeignNamedHValueRefs interp new_bindings
           let ce2  = extendClosureEnv (closure_env le2) nms_fhvs
-              !pls2 = pls { linker_env = le2 { closure_env = ce2 } }
+              !pls2 = pls { linker_env = le2 { closure_env = ce2 }
+                          , linked_breaks = lb2 }
           return (pls2, (nms_fhvs, links_needed, units_needed))
   where
     cbcs = linkableBCOs linkable
@@ -911,11 +928,15 @@ dynLinkBCOs interp pls bcos = do
 
 
             le1 = linker_env pls
-            ie2 = foldr plusNameEnv (itbl_env le1) (map bc_itbls cbcs)
-            ae2 = foldr plusNameEnv (addr_env le1) (map bc_strs cbcs)
-            le2 = le1 { itbl_env = ie2, addr_env = ae2 }
+            lb1 = linked_breaks pls
+        ie2 <- linkITbls interp (itbl_env le1) (concatMap bc_itbls cbcs)
+        ae2 <- foldlM (\env cbc -> allocateTopStrings interp (bc_strs cbc) env) (addr_env le1) cbcs
+        be2 <- allocateBreakArrays interp (breakarray_env lb1) (catMaybes $ map bc_breaks cbcs)
+        ce2 <- allocateCCS         interp (ccs_env lb1)        (catMaybes $ map bc_breaks cbcs)
+        let le2 = le1 { itbl_env = ie2, addr_env = ae2 }
+        let lb2 = lb1 { breakarray_env = be2, ccs_env = ce2 }
 
-        names_and_refs <- linkSomeBCOs interp (pkgs_loaded pls) le2 cbcs
+        names_and_refs <- linkSomeBCOs interp (pkgs_loaded pls) le2 lb2 cbcs
 
         -- We only want to add the external ones to the ClosureEnv
         let (to_add, to_drop) = partition (isExternalName.fst) names_and_refs
@@ -926,19 +947,21 @@ dynLinkBCOs interp pls bcos = do
         new_binds <- makeForeignNamedHValueRefs interp to_add
 
         let ce2 = extendClosureEnv (closure_env le2) new_binds
-        return $! pls1 { linker_env = le2 { closure_env = ce2 } }
+        return $! pls1 { linker_env = le2 { closure_env = ce2 }
+                       , linked_breaks = lb2 }
 
 -- Link a bunch of BCOs and return references to their values
 linkSomeBCOs :: Interp
              -> PkgsLoaded
              -> LinkerEnv
+             -> LinkedBreaks
              -> [CompiledByteCode]
              -> IO [(Name,HValueRef)]
                         -- The returned HValueRefs are associated 1-1 with
                         -- the incoming unlinked BCOs.  Each gives the
                         -- value of the corresponding unlinked BCO
 
-linkSomeBCOs interp pkgs_loaded le mods = foldr fun do_link mods []
+linkSomeBCOs interp pkgs_loaded le lb mods = foldr fun do_link mods []
  where
   fun CompiledByteCode{..} inner accum =
     inner (Foldable.toList bc_bcos : accum)
@@ -948,7 +971,7 @@ linkSomeBCOs interp pkgs_loaded le mods = foldr fun do_link mods []
     let flat = [ bco | bcos <- mods, bco <- bcos ]
         names = map unlinkedBCOName flat
         bco_ix = mkNameEnv (zip names [0..])
-    resolved <- sequence [ linkBCO interp pkgs_loaded le bco_ix bco | bco <- flat ]
+    resolved <- sequence [ linkBCO interp pkgs_loaded le lb bco_ix bco | bco <- flat ]
     hvrefs <- createBCOs interp resolved
     return (zip names hvrefs)
 
@@ -957,6 +980,11 @@ makeForeignNamedHValueRefs
   :: Interp -> [(Name,HValueRef)] -> IO [(Name,ForeignHValue)]
 makeForeignNamedHValueRefs interp bindings =
   mapM (\(n, hvref) -> (n,) <$> mkFinalizedHValue interp hvref) bindings
+
+linkITbls :: Interp -> ItblEnv -> [(Name, ConInfoTable)] -> IO ItblEnv
+linkITbls interp = foldlM $ \env (nm, itbl) -> do
+  r <- interpCmd interp $ MkConInfoTable itbl
+  evaluate $ extendNameEnv env nm (nm, ItblPtr r)
 
 {- **********************************************************************
 
@@ -1041,9 +1069,13 @@ unload_wkr interp keep_linkables pls@LoaderState{..}  = do
       keep_name n = isExternalName n &&
                     nameModule n `elemModuleEnv` remaining_bcos_loaded
 
-      !new_pls = pls { linker_env = filterLinkerEnv keep_name linker_env,
-                       bcos_loaded = remaining_bcos_loaded,
-                       objs_loaded = remaining_objs_loaded }
+      keep_mod :: Module -> Bool
+      keep_mod m = m `elemModuleEnv` remaining_bcos_loaded
+
+      !new_pls = pls { linker_env    = filterLinkerEnv keep_name linker_env,
+                       linked_breaks = filterLinkedBreaks keep_mod linked_breaks,
+                       bcos_loaded   = remaining_bcos_loaded,
+                       objs_loaded   = remaining_objs_loaded }
 
   return new_pls
   where
@@ -1614,3 +1646,62 @@ maybePutStr logger s = maybePutSDoc logger (text s)
 
 maybePutStrLn :: Logger -> String -> IO ()
 maybePutStrLn logger s = maybePutSDoc logger (text s <> text "\n")
+
+-- | see Note [Generating code for top-level string literal bindings]
+allocateTopStrings ::
+  Interp -> [(Name, ByteString)] -> AddrEnv -> IO AddrEnv
+allocateTopStrings interp topStrings prev_env = do
+  let (bndrs, strings) = unzip topStrings
+  ptrs <- interpCmd interp $ MallocStrings strings
+  evaluate $ extendNameEnvList prev_env (zipWith mk_entry bndrs ptrs)
+  where
+    mk_entry nm ptr = (nm, (nm, AddrPtr ptr))
+
+-- | Given a list of 'InternalModBreaks' collected from a list of
+-- 'CompiledByteCode', allocate the 'BreakArray' used to trigger breakpoints.
+allocateBreakArrays ::
+  Interp ->
+  ModuleEnv (ForeignRef BreakArray) ->
+  [InternalModBreaks] ->
+  IO (ModuleEnv (ForeignRef BreakArray))
+allocateBreakArrays interp =
+  foldlM
+    ( \be0 InternalModBreaks{imodBreaks_modBreaks=ModBreaks {..}} -> do
+        -- If no BreakArray is assigned to this module yet, create one
+        if not $ elemModuleEnv modBreaks_module be0 then do
+          let count = numElements modBreaks_locs
+          breakArray <- GHCi.newBreakArray interp count
+          evaluate $ extendModuleEnv be0 modBreaks_module breakArray
+        else
+          return be0
+    )
+
+-- | Given a list of 'InternalModBreaks' collected from a list
+-- of 'CompiledByteCode', allocate the 'CostCentre' arrays when profiling is
+-- enabled.
+allocateCCS ::
+  Interp ->
+  ModuleEnv (Array BreakTickIndex (RemotePtr CostCentre)) ->
+  [InternalModBreaks] ->
+  IO (ModuleEnv (Array BreakTickIndex (RemotePtr CostCentre)))
+allocateCCS interp ce mbss
+  | interpreterProfiled interp =
+      foldlM
+        ( \ce0 InternalModBreaks{imodBreaks_modBreaks=ModBreaks {..}} -> do
+            ccs <-
+              mkCostCentres
+                interp
+                (moduleNameString $ moduleName modBreaks_module)
+                (elems modBreaks_ccs)
+            if not $ elemModuleEnv modBreaks_module ce0 then do
+              evaluate $
+                extendModuleEnv ce0 modBreaks_module $
+                  listArray
+                    (0, length ccs - 1)
+                    ccs
+            else
+              return ce0
+        )
+        ce
+        mbss
+  | otherwise = pure ce

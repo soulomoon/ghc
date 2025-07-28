@@ -47,9 +47,8 @@ module GHC.Tc.Utils.TcMType (
   newTcEvBinds, newNoTcEvBinds, addTcEvBind,
   emitNewExprHole,
 
-  newCoercionHole, newCoercionHoleO, newVanillaCoercionHole,
+  newCoercionHole,
   fillCoercionHole, isFilledCoercionHole,
-  unpackCoercionHole, unpackCoercionHole_maybe,
   checkCoercionHole,
 
   newImplication,
@@ -111,11 +110,10 @@ import {-# SOURCE #-} GHC.Tc.Utils.Unify( unifyInvisibleType, tcSubMult )
 import GHC.Tc.Types.Origin
 import GHC.Tc.Types.Constraint
 import GHC.Tc.Types.Evidence
-import GHC.Tc.Types.CtLoc( CtLoc, ctLocOrigin )
+import GHC.Tc.Types.CtLoc( CtLoc )
 import GHC.Tc.Utils.Monad        -- TcType, amongst others
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Errors.Types
-import GHC.Tc.Zonk.Type
 import GHC.Tc.Zonk.TcType
 
 import GHC.Builtin.Names
@@ -202,7 +200,7 @@ newEvVar ty = do { name <- newSysName (predTypeOccName ty)
 newWantedWithLoc :: CtLoc -> PredType -> TcM CtEvidence
 newWantedWithLoc loc pty
   = do dst <- case classifyPredType pty of
-                EqPred {} -> HoleDest  <$> newCoercionHole loc pty
+                EqPred {} -> HoleDest  <$> newCoercionHole pty
                 _         -> EvVarDest <$> newEvVar pty
        return $ CtWanted $
          WantedCt { ctev_dest      = dst
@@ -228,9 +226,9 @@ newWanteds orig = mapM (newWanted orig Nothing)
 ----------------------------------------------
 
 cloneWantedCtEv :: CtEvidence -> TcM CtEvidence
-cloneWantedCtEv (CtWanted ctev@(WantedCt { ctev_pred = pty, ctev_dest = HoleDest _, ctev_loc = loc }))
+cloneWantedCtEv (CtWanted ctev@(WantedCt { ctev_pred = pty, ctev_dest = HoleDest _ }))
   | isEqPred pty
-  = do { co_hole <- newCoercionHole loc pty
+  = do { co_hole <- newCoercionHole pty
        ; return $ CtWanted (ctev { ctev_dest = HoleDest co_hole }) }
   | otherwise
   = pprPanic "cloneWantedCtEv" (ppr pty)
@@ -278,7 +276,7 @@ emitWantedEqs origin pairs
 -- | Emits a new equality constraint
 emitWantedEq :: CtOrigin -> TypeOrKind -> Role -> TcType -> TcType -> TcM Coercion
 emitWantedEq origin t_or_k role ty1 ty2
-  = do { hole <- newCoercionHoleO origin pty
+  = do { hole <- newCoercionHole pty
        ; loc  <- getCtLocM origin (Just t_or_k)
        ; emitSimple $ mkNonCanonical $ CtWanted $
            WantedCt { ctev_pred      = pty
@@ -360,23 +358,13 @@ newImplication
 ************************************************************************
 -}
 
-newVanillaCoercionHole :: TcPredType -> TcM CoercionHole
-newVanillaCoercionHole = new_coercion_hole False
-
-newCoercionHole :: CtLoc -> TcPredType -> TcM CoercionHole
-newCoercionHole loc = newCoercionHoleO (ctLocOrigin loc)
-
-newCoercionHoleO :: CtOrigin -> TcPredType -> TcM CoercionHole
-newCoercionHoleO (KindEqOrigin {}) pty = new_coercion_hole True pty
-newCoercionHoleO _ pty                 = new_coercion_hole False pty
-
-new_coercion_hole :: Bool -> TcPredType -> TcM CoercionHole
-new_coercion_hole hetero_kind pred_ty
+newCoercionHole :: TcPredType -> TcM CoercionHole
+-- For the Bool, see (EIK2) in Note [Equalities with heterogeneous kinds]
+newCoercionHole pred_ty
   = do { co_var <- newEvVar pred_ty
        ; traceTc "New coercion hole:" (ppr co_var <+> dcolon <+> ppr pred_ty)
        ; ref <- newMutVar Nothing
-       ; return $ CoercionHole { ch_co_var = co_var, ch_ref = ref
-                               , ch_hetero_kind = hetero_kind } }
+       ; return $ CoercionHole { ch_co_var = co_var, ch_ref = ref } }
 
 -- | Put a value in a coercion hole
 fillCoercionHole :: CoercionHole -> Coercion -> TcM ()
@@ -458,11 +446,11 @@ newInferExpType = new_inferExpType Nothing
 
 newInferExpTypeFRR :: FixedRuntimeRepContext -> TcM ExpTypeFRR
 newInferExpTypeFRR frr_orig
-  = do { th_stage <- getStage
+  = do { th_lvl <- getThLevel
        ; if
           -- See [Wrinkle: Typed Template Haskell]
           -- in Note [hasFixedRuntimeRep] in GHC.Tc.Utils.Concrete.
-          | Brack _ (TcPending {}) <- th_stage
+          | TypedBrack _ <- th_lvl
           -> new_inferExpType Nothing
 
           | otherwise
@@ -800,11 +788,11 @@ newConcreteTyVar :: HasDebugCallStack => ConcreteTvOrigin
                  -> FastString -> TcKind -> TcM TcTyVar
 newConcreteTyVar reason fs kind
   = assertPpr (isConcreteType kind) assert_msg $
-  do { th_stage <- getStage
+  do { th_lvl <- getThLevel
      ; if
         -- See [Wrinkle: Typed Template Haskell]
         -- in Note [hasFixedRuntimeRep] in GHC.Tc.Utils.Concrete.
-        | Brack _ (TcPending {}) <- th_stage
+        | TypedBrack _ <- th_lvl
         -> newNamedAnonMetaTyVar fs TauTv kind
 
         | otherwise
@@ -986,9 +974,9 @@ newOpenFlexiTyVar
 -- in GHC.Tc.Utils.Concrete.
 newOpenFlexiFRRTyVar :: FixedRuntimeRepContext -> TcM TcTyVar
 newOpenFlexiFRRTyVar frr_ctxt
-  = do { th_stage <- getStage
-       ; case th_stage of
-          { Brack _ (TcPending {}) -- See [Wrinkle: Typed Template Haskell]
+  = do { th_lvl <- getThLevel
+       ; case th_lvl of
+          { TypedBrack _ -- See [Wrinkle: Typed Template Haskell]
               -> newOpenFlexiTyVar -- in Note [hasFixedRuntimeRep] in GHC.Tc.Utils.Concrete.
           ; _ ->
    mdo { let conc_orig = ConcreteFRR $
@@ -1040,11 +1028,11 @@ newMetaTyVarX = new_meta_tv_x TauTv
 -- | Like 'newMetaTyVarX', but for concrete type variables.
 newConcreteTyVarX :: ConcreteTvOrigin -> Subst -> TyVar -> TcM (Subst, TcTyVar)
 newConcreteTyVarX conc subst tv
-  = do { th_stage <- getStage
+  = do { th_lvl <- getThLevel
        ; if
           -- See [Wrinkle: Typed Template Haskell]
           -- in Note [hasFixedRuntimeRep] in GHC.Tc.Utils.Concrete.
-          | Brack _ (TcPending {}) <- th_stage
+          | TypedBrack _  <- th_lvl
           -> new_meta_tv_x TauTv subst tv
           | otherwise
           -> new_meta_tv_x (ConcreteTv conc) subst tv }
@@ -1583,7 +1571,7 @@ collect_cand_qtvs_co orig_ty cur_lvl bound = go_co
     go_co dv (SubCo co)              = go_co dv co
 
     go_co dv (HoleCo hole)
-      = do m_co <- unpackCoercionHole_maybe hole
+      = do m_co <- liftZonkM (unpackCoercionHole_maybe hole)
            case m_co of
              Just co -> go_co dv co
              Nothing -> go_cv dv (coHoleCoVar hole)

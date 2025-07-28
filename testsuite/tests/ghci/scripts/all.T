@@ -357,6 +357,7 @@ test('T20101', normal, ghci_script, ['T20101.script'])
 test('T20206', normal, ghci_script, ['T20206.script'])
 test('T20217', normal, ghci_script, ['T20217.script'])
 test('T20455', normal, ghci_script, ['T20455.script'])
+test('print-unicode-syntax', normal, ghci_script, ['print-unicode-syntax.script'])
 test('shadow-bindings', normal, ghci_script, ['shadow-bindings.script'])
 test('T925', normal, ghci_script, ['T925.script'])
 test('T7388', normal, ghci_script, ['T7388.script'])
@@ -386,3 +387,9 @@ test('T13869', extra_files(['T13869a.hs', 'T13869b.hs']), ghci_script, ['T13869.
 test('ListTuplePunsPpr', normal, ghci_script, ['ListTuplePunsPpr.script'])
 test('ListTuplePunsPprNoAbbrevTuple', [expect_broken(23135), limit_stdout_lines(13)], ghci_script, ['ListTuplePunsPprNoAbbrevTuple.script'])
 test('T24459', normal, ghci_script, ['T24459.script'])
+
+# Test package renaming in GHCi session
+test('GhciPackageRename',
+     [extra_hc_opts("-hide-all-packages -package 'containers (Data.Map as Prelude)'")],
+     ghci_script,
+     ['GhciPackageRename.script'])

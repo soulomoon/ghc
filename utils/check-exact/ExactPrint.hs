@@ -1605,7 +1605,7 @@ instance ExactPrint (ImportDecl GhcPs) where
                     = (ideclExt idecl) { ideclAnn = setAnchorEpa (ideclAnn $ ideclExt idecl) anc ts cs} }
 
   exact (ImportDecl (XImportDeclPass ann msrc impl)
-                     modname mpkg src safeflag qualFlag mAs hiding) = do
+                     modname mpkg src st safeflag qualFlag mAs hiding) = do
 
     ann0 <- markLensFun' ann limportDeclAnnImport markEpToken
     let (EpAnn _anc an _cs) = ann0
@@ -1667,7 +1667,7 @@ instance ExactPrint (ImportDecl GhcPs) where
                   }
 
     return (ImportDecl (XImportDeclPass (EpAnn anc' an2 cs') msrc impl)
-                     modname' mpkg src safeflag qualFlag mAs' hiding')
+                     modname' mpkg src st safeflag qualFlag mAs' hiding')
 
 
 -- ---------------------------------------------------------------------
@@ -3072,9 +3072,8 @@ instance ExactPrint (HsExpr GhcPs) where
     return (HsUntypedBracket a (VarBr an0 b e'))
 
   exact (HsTypedSplice an s)   = do
-    an0 <- markEpToken an
     s' <- markAnnotated s
-    return (HsTypedSplice an0 s')
+    return (HsTypedSplice an s')
 
   exact (HsUntypedSplice an s) = do
     s' <- markAnnotated s
@@ -3167,6 +3166,16 @@ instance ExactPrint (HsPragE GhcPs) where
     l1' <- printStringAtAA l1 (sourceTextToString (sl_st sl) (unpackFS $ sl_fs sl))
     c' <- markEpToken c
     return (HsPragSCC (AnnPragma o' c' s l1' l2 t m,st) sl)
+
+instance ExactPrint (HsTypedSplice GhcPs) where
+  getAnnotationEntry _ = NoEntryVal
+
+  setAnnotationAnchor a _ _ _ = a
+
+  exact (HsTypedSpliceExpr an e) = do
+    an0 <- markEpToken an
+    e' <- markAnnotated e
+    return (HsTypedSpliceExpr an0 e')
 
 
 -- ---------------------------------------------------------------------
@@ -4272,7 +4281,8 @@ instance ExactPrint (ConDecl GhcPs) where
 
   exact (ConDeclGADT { con_g_ext = AnnConDeclGADT ops cps dcol
                      , con_names = cons
-                     , con_bndrs = bndrs
+                     , con_outer_bndrs = outer_bndrs
+                     , con_inner_bndrs = inner_bndrs
                      , con_mb_cxt = mcxt, con_g_args = args
                      , con_res_ty = res_ty, con_doc = doc }) = do
     cons' <- mapM markAnnotated cons
@@ -4281,9 +4291,11 @@ instance ExactPrint (ConDecl GhcPs) where
     epTokensToComments ")" cps
 
     -- Work around https://gitlab.haskell.org/ghc/ghc/-/issues/20558
-    bndrs' <- case bndrs of
-      L _ (HsOuterImplicit _) -> return bndrs
-      _ -> markAnnotated bndrs
+    outer_bndrs' <- case outer_bndrs of
+      L _ (HsOuterImplicit _) -> return outer_bndrs
+      _ -> markAnnotated outer_bndrs
+
+    inner_bndrs' <- mapM markAnnotated inner_bndrs
 
     mcxt' <- mapM markAnnotated mcxt
     args' <-
@@ -4298,7 +4310,8 @@ instance ExactPrint (ConDecl GhcPs) where
     res_ty' <- markAnnotated res_ty
     return (ConDeclGADT { con_g_ext = AnnConDeclGADT [] [] dcol'
                         , con_names = cons'
-                        , con_bndrs = bndrs'
+                        , con_outer_bndrs = outer_bndrs'
+                        , con_inner_bndrs = inner_bndrs'
                         , con_mb_cxt = mcxt', con_g_args = args'
                         , con_res_ty = res_ty', con_doc = doc })
 
@@ -4592,6 +4605,10 @@ instance ExactPrint (IEWrappedName GhcPs) where
     r' <- markEpToken r
     n' <- markAnnotated n
     return (IEType r' n')
+  exact (IEData r n) = do
+    r' <- markEpToken r
+    n' <- markAnnotated n
+    return (IEData r' n')
 
 -- ---------------------------------------------------------------------
 

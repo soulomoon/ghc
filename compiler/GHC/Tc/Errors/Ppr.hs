@@ -119,6 +119,7 @@ import GHC.Data.List.SetOps ( nubOrdBy )
 import GHC.Data.Maybe
 import GHC.Data.Pair
 import GHC.Settings.Constants (mAX_TUPLE_SIZE, mAX_CTUPLE_SIZE)
+import GHC.Utils.Lexeme
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
@@ -129,6 +130,7 @@ import GHC.Data.BooleanFormula (pprBooleanFormulaNice)
 
 import Data.List.NonEmpty (NonEmpty(..))
 import qualified Data.List.NonEmpty as NE
+import qualified Data.Set as Set
 import Data.Foldable ( fold )
 import Data.Function (on)
 import Data.List ( groupBy, sortBy, tails
@@ -1133,10 +1135,6 @@ instance Diagnostic TcRnMessage where
     TcRnCannotBindTyVarsInPatBind _offenders
       -> mkSimpleDecorated $
            text "Binding type variables is not allowed in pattern bindings"
-    TcRnTooManyTyArgsInConPattern con_like expected_number actual_number
-      -> mkSimpleDecorated $
-           text "Too many type arguments in constructor pattern for" <+> quotes (ppr con_like) $$
-           text "Expected no more than" <+> ppr expected_number <> semi <+> text "got" <+> ppr actual_number
     TcRnMultipleInlinePragmas poly_id fst_inl_prag inl_prags
       -> mkSimpleDecorated $
            hang (text "Multiple INLINE pragmas for" <+> ppr poly_id)
@@ -1515,29 +1513,13 @@ instance Diagnostic TcRnMessage where
       hsep [ text "Unknown type variable" <> plural errorVars
            , text "on the RHS of injectivity condition:"
            , interpp'SP errorVars ]
-    TcRnBadlyStaged reason bind_lvl use_lvl
+    TcRnBadlyLevelled reason bind_lvls use_lvl lift_attempt _reason
+      -> pprTcRnBadlyLevelled reason bind_lvls use_lvl lift_attempt
+    TcRnBadlyLevelledType name bind_lvls use_lvl
       -> mkSimpleDecorated $
-         vcat $
-         [ text "Stage error:" <+> pprStageCheckReason reason <+>
-           hsep [text "is bound at stage" <+> ppr bind_lvl,
-                 text "but used at stage" <+> ppr use_lvl]
-         ] ++
-         [ hsep [ text "Hint: quoting" <+> thBrackets (ppUnless (isValName n) "t") (ppr n)
-                , text "or an enclosing expression would allow the quotation to be used in an earlier stage"
-                ]
-         | StageCheckSplice n <- [reason]
-         ]
-    TcRnBadlyStagedType name bind_lvl use_lvl
-      -> mkSimpleDecorated $
-         text "Badly staged type:" <+> ppr name <+>
-         hsep [text "is bound at stage" <+> ppr bind_lvl,
-               text "but used at stage" <+> ppr use_lvl]
-    TcRnStageRestriction reason
-      -> mkSimpleDecorated $
-         sep [ text "GHC stage restriction:"
-             , nest 2 (vcat [ pprStageCheckReason reason <+>
-                              text "is used in a top-level splice, quasi-quote, or annotation,"
-                            , text "and must be imported, not defined locally"])]
+         text "Badly levelled type:" <+> ppr name <+>
+         fsep [text "is bound at" <+> pprThBindLevel bind_lvls,
+               text "but used at level" <+> ppr use_lvl]
     TcRnTyThingUsedWrong sort thing name
       -> mkSimpleDecorated $
          pprTyThingUsedWrong sort thing name
@@ -1764,21 +1746,15 @@ instance Diagnostic TcRnMessage where
                 , inHsDocContext doc ]
 
     TcRnDataKindsError typeOrKind thing
-      -- See Note [Checking for DataKinds] (Wrinkle: Migration story for
-      -- DataKinds typechecker errors) in GHC.Tc.Validity for why we give
-      -- different diagnostic messages below.
       -> case thing of
            Left renamer_thing ->
-             mkSimpleDecorated $
-               text "Illegal" <+> ppr_level <> colon <+> quotes (ppr renamer_thing)
+             mkSimpleDecorated $ msg renamer_thing
            Right typechecker_thing ->
-             mkSimpleDecorated $ vcat
-               [ text "An occurrence of" <+> quotes (ppr typechecker_thing) <+>
-                 text "in a" <+> ppr_level <+> text "requires DataKinds."
-               , text "Future versions of GHC will turn this warning into an error."
-               ]
+             mkSimpleDecorated $ msg typechecker_thing
       where
-        ppr_level = text $ levelString typeOrKind
+        msg :: Outputable a => a -> SDoc
+        msg thing = text "Illegal" <+> text (levelString typeOrKind) <>
+                    colon <+> quotes (ppr thing)
 
     TcRnTypeSynonymCycle decl_or_tcs
       -> mkSimpleDecorated $
@@ -2367,8 +2343,6 @@ instance Diagnostic TcRnMessage where
       -> ErrorWithoutFlag
     TcRnCannotBindTyVarsInPatBind{}
       -> ErrorWithoutFlag
-    TcRnTooManyTyArgsInConPattern{}
-      -> ErrorWithoutFlag
     TcRnMultipleInlinePragmas{}
       -> WarningWithoutFlag
     TcRnUnexpectedPragmas{}
@@ -2489,12 +2463,10 @@ instance Diagnostic TcRnMessage where
       -> ErrorWithoutFlag
     TcRnUnknownTyVarsOnRhsOfInjCond{}
       -> ErrorWithoutFlag
-    TcRnBadlyStaged{}
-      -> ErrorWithoutFlag
-    TcRnBadlyStagedType{}
-      -> WarningWithFlag Opt_WarnBadlyStagedTypes
-    TcRnStageRestriction{}
-      -> ErrorWithoutFlag
+    TcRnBadlyLevelled _ _ _ _ reason
+      -> reason
+    TcRnBadlyLevelledType{}
+      -> WarningWithFlag Opt_WarnBadlyLevelledTypes
     TcRnTyThingUsedWrong{}
       -> ErrorWithoutFlag
     TcRnCannotDefaultKindVar{}
@@ -2521,6 +2493,8 @@ instance Diagnostic TcRnMessage where
       -> WarningWithFlag Opt_WarnIncompleteRecordSelectors
     TcRnBadFieldAnnotation _ _ LazyFieldsDisabled
       -> ErrorWithoutFlag
+    TcRnBadFieldAnnotation _ _ UnusableUnpackPragma
+      -> WarningWithFlag Opt_WarnUnusableUnpackPragmas
     TcRnBadFieldAnnotation{}
       -> WarningWithoutFlag
     TcRnSuperclassCycle{}
@@ -2581,17 +2555,8 @@ instance Diagnostic TcRnMessage where
       -> ErrorWithoutFlag
     TcRnUnusedQuantifiedTypeVar{}
       -> WarningWithFlag Opt_WarnUnusedForalls
-    TcRnDataKindsError _ thing
-      -- DataKinds errors can arise from either the renamer (Left) or the
-      -- typechecker (Right). The latter category of DataKinds errors are a
-      -- fairly recent addition to GHC (introduced in GHC 9.10), and in order
-      -- to prevent these new errors from breaking users' code, we temporarily
-      -- downgrade these errors to warnings. See Note [Checking for DataKinds]
-      -- (Wrinkle: Migration story for DataKinds typechecker errors)
-      -- in GHC.Tc.Validity.
-      -> case thing of
-           Left  _ -> ErrorWithoutFlag
-           Right _ -> WarningWithFlag Opt_WarnDataKindsTC
+    TcRnDataKindsError{}
+      -> ErrorWithoutFlag
     TcRnTypeSynonymCycle{}
       -> ErrorWithoutFlag
     TcRnZonkerMessage msg
@@ -2993,7 +2958,7 @@ instance Diagnostic TcRnMessage where
              -> let tc_nm = tyConName tc
                     dc = dataConName $ head $ tyConDataCons tc
                 in [ ImportSuggestion (occName dc)
-                   $ ImportDataCon Nothing (nameOccName tc_nm) ]
+                   $ ImportDataCon Nothing False False (nameOccName tc_nm) ]
              | UnliftedFFITypesNeeded <- why
              -> [suggestExtension LangExt.UnliftedFFITypes]
            _ -> noHints
@@ -3039,8 +3004,6 @@ instance Diagnostic TcRnMessage where
     TcRnCannotBindScopedTyVarInPatSig{}
       -> noHints
     TcRnCannotBindTyVarsInPatBind{}
-      -> noHints
-    TcRnTooManyTyArgsInConPattern{}
       -> noHints
     TcRnMultipleInlinePragmas{}
       -> noHints
@@ -3174,11 +3137,9 @@ instance Diagnostic TcRnMessage where
       -> noHints
     TcRnUnknownTyVarsOnRhsOfInjCond{}
       -> noHints
-    TcRnBadlyStaged{}
+    TcRnBadlyLevelled{}
       -> noHints
-    TcRnBadlyStagedType{}
-      -> noHints
-    TcRnStageRestriction{}
+    TcRnBadlyLevelledType{}
       -> noHints
     TcRnTyThingUsedWrong{}
       -> noHints
@@ -3292,17 +3253,51 @@ instance Diagnostic TcRnMessage where
       -> noHints
     TcRnRedundantSourceImport{}
       -> noHints
-    TcRnImportLookup (ImportLookupBad k _ is ie patsyns_enabled) ->
+    TcRnImportLookup (ImportLookupBad k _ is ie exts) ->
       let mod_name = moduleName $ is_mod is
           occ = rdrNameOcc $ ieName ie
+          could_change_item item_suggestion =
+            [useExtensionInOrderTo empty LangExt.ExplicitNamespaces | suggest_ext] ++
+            [ ImportSuggestion occ $
+              CouldChangeImportItem mod_name item_suggestion ]
+            where
+              suggest_ext
+                | ile_explicit_namespaces exts = False  -- extension already on
+                | otherwise =
+                    case item_suggestion of
+                      -- ImportItemRemove* -> False
+                      ImportItemRemoveType{}            -> False
+                      ImportItemRemoveData{}            -> False
+                      ImportItemRemovePattern{}         -> False
+                      ImportItemRemoveSubordinateType{} -> False
+                      ImportItemRemoveSubordinateData{} -> False
+                      -- ImportItemAdd* -> True
+                      ImportItemAddType{} -> True
       in case k of
-        BadImportAvailVar          -> [ImportSuggestion occ $ CouldRemoveTypeKeyword mod_name]
+        BadImportAvailVar -> could_change_item ImportItemRemoveType
         BadImportNotExported suggs -> suggs
-        BadImportAvailTyCon ex_ns  ->
-          [useExtensionInOrderTo empty LangExt.ExplicitNamespaces | not ex_ns]
-          ++ [ImportSuggestion occ $ CouldAddTypeKeyword mod_name]
-        BadImportAvailDataCon par  -> [ImportSuggestion occ $ ImportDataCon (Just (mod_name, patsyns_enabled)) par]
+        BadImportAvailTyCon
+          -- The three cases (TyOp, DataKw, PatternKw) are laid out
+          -- in Note [Reasons for BadImportAvailTyCon] in GHC.Tc.Errors.Types
+          | isSymOcc occ    -> could_change_item ImportItemAddType        -- Case (TyOp)
+          | otherwise       ->  -- Non-operator cases
+              case unLoc (ieLIEWrappedName ie) of
+                IEData{}    -> could_change_item ImportItemRemoveData     -- Case (DataKw)
+                IEPattern{} -> could_change_item ImportItemRemovePattern  -- Case (PatternKw)
+                _           -> panic "diagnosticHints: unexpected BadImportAvailTyCon"
+
+        BadImportAvailDataCon par  ->
+          [ ImportSuggestion occ $
+            ImportDataCon { ies_suggest_import_from = Just mod_name
+                          , ies_suggest_pattern_keyword = ile_pattern_synonyms exts
+                              && not (ile_explicit_namespaces exts) -- do not suggest 'pattern' when we can suggest 'data'
+                          , ies_suggest_data_keyword    = ile_explicit_namespaces exts
+                          , ies_parent = par } ]
         BadImportNotExportedSubordinates{} -> noHints
+        BadImportNonTypeSubordinates _ nontype1 ->
+          could_change_item (ImportItemRemoveSubordinateType (nameOccName . greName <$> nontype1))
+        BadImportNonDataSubordinates _ nondata1 ->
+          could_change_item (ImportItemRemoveSubordinateData (nameOccName . greName <$> nondata1))
     TcRnImportLookup{}
       -> noHints
     TcRnUnusedImport{}
@@ -3389,6 +3384,22 @@ instance Diagnostic TcRnMessage where
 
   diagnosticCode = constructorCode @GHC
 
+pprTcRnBadlyLevelled :: LevelCheckReason -> Set.Set ThLevelIndex -> ThLevelIndex -> Maybe ErrorItem -> DecoratedSDoc
+pprTcRnBadlyLevelled reason bind_lvls use_lvl lift_attempt = mkDecorated $
+         [ fsep [ text "Level error:", pprLevelCheckReason reason
+                , text "is bound at" <+> pprThBindLevel bind_lvls
+                , text "but used at level" <+> ppr use_lvl]
+         ] ++
+         [hang (text "Could not be resolved by implicit lifting due to the following error:") 2
+          (text "No instance for:" <+> quotes (ppr (errorItemPred item)))
+         | Just item <- [lift_attempt]
+         ] ++
+         [ vcat (text "Available from the imports:" : ppr_imports (gre_imp gre))
+         | LevelCheckSplice _ (Just gre) <- [reason]
+         , not (isEmptyBag (gre_imp gre)) ]
+  where
+    ppr_imports :: Bag ImportSpec -> [SDoc]
+    ppr_imports = map ((bullet <+>) . ppr ) . bagToList
 
 note :: SDoc -> SDoc
 note note = "Note" <> colon <+> note <> dot
@@ -3999,17 +4010,24 @@ pprTcSolverReportMsg _ (FixedRuntimeRepError frr_origs) =
                            FixedRuntimeRepOrigin
                              { frr_type    = ty
                              , frr_context = frr_ctxt }
-                       , frr_info_not_concrete =
-                         mb_not_conc }) =
+                       , frr_info_not_concrete = mb_not_conc
+                       , frr_info_other_origin = mb_other_orig }) =
       -- Add bullet points if there is more than one error.
       (if length frr_origs > 1 then (bullet <+>) else id) $
         vcat [ sep [ pprFixedRuntimeRepContext frr_ctxt
                    , text "does not have a fixed runtime representation." ]
              , type_printout ty
+             , case mb_other_orig of
+                 Nothing -> empty
+                 Just o -> other_context o
              , case mb_not_conc of
-                Nothing -> empty
-                Just (conc_tv, not_conc) ->
-                  unsolved_concrete_eq_explanation conc_tv not_conc ]
+                Just (conc_tv, not_conc)
+                  | conc_tv `elemVarSet` tyCoVarsOfType ty
+                  -- Only show this message if 'conc_tv' appears somewhere
+                  -- in the type, otherwise it's not helpful.
+                  -> unsolved_concrete_eq_explanation conc_tv not_conc
+                _ -> empty
+            ]
 
     -- Don't print out the type (only the kind), if the type includes
     -- a confusing cast, unless the user passed -fprint-explicit-coercions.
@@ -4047,6 +4065,18 @@ pprTcSolverReportMsg _ (FixedRuntimeRepError frr_origs) =
         else vcat [ text "Its type is:"
                   , nest 2 $ ppr ty <+> dcolon <+> pprWithTYPE (typeKind ty) ]
 
+    other_context :: CtOrigin -> SDoc
+    other_context = \case
+      TypeEqOrigin { uo_actual = actual_ty, uo_expected = exp_ty } ->
+        -- TODO: use uo_thing in the error message as well?
+        hang (text "When unifying:") 2 $
+          vcat [ bullet <+> ppr actual_ty
+               , bullet <+> ppr exp_ty
+               ]
+      KindEqOrigin _ _ orig' _
+        -> other_context orig'
+      _ -> empty -- Don't think this ever happens
+
     unsolved_concrete_eq_explanation :: TcTyVar -> Type -> SDoc
     unsolved_concrete_eq_explanation tv not_conc =
           text "Cannot unify" <+> quotes (ppr not_conc)
@@ -4062,10 +4092,6 @@ pprTcSolverReportMsg _ (FixedRuntimeRepError frr_origs) =
           = quotes (text "Levity")
           | otherwise
           = text "type"
-pprTcSolverReportMsg _ (BlockedEquality item) =
-  vcat [ hang (text "Cannot use equality for substitution:")
-           2 (ppr (errorItemPred item))
-       , text "Doing so would be ill-kinded." ]
 pprTcSolverReportMsg _ (ExpectingMoreArguments n thing) =
   text "Expecting" <+> speakN (abs n) <+>
     more <+> quotes (ppr thing)
@@ -5073,8 +5099,6 @@ tcSolverReportMsgHints ctxt = \case
     -> mismatchMsgHints ctxt mismatch_msg
   FixedRuntimeRepError {}
     -> noHints
-  BlockedEquality {}
-    -> noHints
   ExpectingMoreArguments {}
     -> noHints
   UnboundImplicitParams {}
@@ -5778,11 +5802,11 @@ pprWrongThingSort =
     WrongThingTyCon -> "type constructor"
     WrongThingAxiom -> "axiom"
 
-pprStageCheckReason :: StageCheckReason -> SDoc
-pprStageCheckReason = \case
-  StageCheckInstance _ t ->
+pprLevelCheckReason :: LevelCheckReason -> SDoc
+pprLevelCheckReason = \case
+  LevelCheckInstance _ t ->
     text "instance for" <+> quotes (ppr t)
-  StageCheckSplice t ->
+  LevelCheckSplice t _ ->
     quotes (ppr t)
 
 pprUninferrableTyVarCtx :: UninferrableTyVarCtx -> SDoc
@@ -5814,7 +5838,7 @@ pprBadFieldAnnotationReason = \case
     text "Lazy field annotations (~) are disabled"
   UnpackWithoutStrictness ->
     text "UNPACK pragma lacks '!'"
-  BackpackUnpackAbstractType ->
+  UnusableUnpackPragma ->
     text "Ignoring unusable UNPACK pragma"
 
 pprSuperclassCycleDetail :: SuperclassCycleDetail -> SDoc
@@ -5855,7 +5879,7 @@ pprDisabledClassExtension cls = \case
 
 pprImportLookup :: ImportLookupReason -> SDoc
 pprImportLookup = \case
-  ImportLookupBad k iface decl_spec ie _ps ->
+  ImportLookupBad k iface decl_spec ie _exts ->
     let
       pprImpDeclSpec :: ModIface -> ImpDeclSpec -> SDoc
       pprImpDeclSpec iface decl_spec =
@@ -5887,15 +5911,54 @@ pprImportLookup = \case
         where
           tycon_occ = rdrNameOcc $ ieName ie
           tycon = parenSymOcc tycon_occ (ppr tycon_occ)
-      BadImportNotExportedSubordinates ns ->
+      BadImportNotExportedSubordinates gre unavailable1 ->
         withContext
-          [ text "an item called" <+> quotes sub <+> text "is exported, but it does not export any children"
-          , text "(constructors, class methods or field names) called"
-          <+> pprWithCommas (quotes . ppr) ns <> dot
+          [ what <+> text "called" <+> parent_name <+> text "is exported, but it does not export"
+          , text "any" <+> what_children <+> text "called" <+> unavailable_names <> dot
           ]
           where
-            sub_occ = rdrNameOcc $ ieName ie
-            sub = parenSymOcc sub_occ (ppr sub_occ)
+            unavailable = NE.toList unavailable1
+            parent_name = (quotes . pprPrefixOcc . nameOccName . gre_name) gre
+            unavailable_names = pprWithCommas (quotes . ppr) unavailable
+            any_names p = any (p . unpackFS) unavailable
+            what = case greInfo gre of
+              IAmTyCon ClassFlavour -> text "a class"
+              IAmTyCon _            -> text "a data type"
+              _                     -> text "an item"
+            what_children = unquotedListWith "or" $ case greInfo gre of
+              IAmTyCon ClassFlavour ->
+                [text "class methods"    | any_names okVarOcc ] ++
+                [text "associated types" | any_names okTcOcc ]
+              IAmTyCon _ ->
+                [text "constructors"  | any_names okConOcc ] ++
+                [text "record fields" | any_names okVarOcc ]
+              _ -> [text "children"]
+      BadImportNonTypeSubordinates gre nontype1 ->
+        withContext
+          [ what <+> text "called" <+> parent_name <+> text "is exported,"
+          , sep [ text "but its subordinate item" <> plural nontype <+> nontype_names
+                , isOrAre nontype <+> "not in the type namespace." ] ]
+          where
+            nontype = NE.toList nontype1
+            parent_name = (quotes . pprPrefixOcc . nameOccName . gre_name) gre
+            nontype_names = pprWithCommas (quotes . pprPrefixOcc . nameOccName . gre_name) nontype
+            what = case greInfo gre of
+              IAmTyCon ClassFlavour -> text "a class"
+              IAmTyCon _            -> text "a data type"
+              _                     -> text "an item"
+      BadImportNonDataSubordinates gre nondata1 ->
+        withContext
+          [ what <+> text "called" <+> parent_name <+> text "is exported,"
+          , sep [ text "but its subordinate item" <> plural nondata <+> nondata_names
+                , isOrAre nondata <+> "not in the data namespace." ] ]
+          where
+            nondata = NE.toList nondata1
+            parent_name = (quotes . pprPrefixOcc . nameOccName . gre_name) gre
+            nondata_names = pprWithCommas (quotes . pprPrefixOcc . nameOccName . gre_name) nondata
+            what = case greInfo gre of
+              IAmTyCon ClassFlavour -> text "a class"
+              IAmTyCon _            -> text "a data type"
+              _                     -> text "an item"
       BadImportAvailDataCon dataType_occ ->
         withContext
           [ text "an item called" <+> quotes datacon
@@ -6885,10 +6948,6 @@ pprTHNameError = \case
     mkSimpleDecorated $
       hang (text "The binder" <+> quotes (ppr name) <+> text "is not a NameU.")
          2 (text "Probable cause: you used mkName instead of newName to generate a binding.")
-  QuotedNameWrongStage quote ->
-    mkSimpleDecorated $
-      sep [ text "Stage error: the non-top-level quoted name" <+> ppr quote
-          , text "must be used at the same stage at which it is bound." ]
 
 pprTHReifyError :: THReifyError -> DecoratedSDoc
 pprTHReifyError = \case
@@ -6909,14 +6968,14 @@ pprTHReifyError = \case
        text "No roles associated with" <+> (ppr thing)
   CannotRepresentType sort ty
     -> mkSimpleDecorated $
-       hsep [text "Can't represent" <+> sort_doc <+>
-             text "in Template Haskell:",
-               nest 2 (ppr ty)]
+       hang (text "Can't represent" <+> sort_doc <+> text "in Template Haskell:")
+          2 (ppr ty)
      where
        sort_doc = text $
          case sort of
            LinearInvisibleArgument -> "linear invisible argument"
            CoercionsInTypes -> "coercions in types"
+           DataConVisibleForall -> "visible forall in the type of a data constructor"
 
 pprTypedTHError :: TypedTHError -> DecoratedSDoc
 pprTypedTHError = \case
@@ -7010,7 +7069,6 @@ thSyntaxErrorReason = \case
 thNameErrorReason :: THNameError -> DiagnosticReason
 thNameErrorReason = \case
   NonExactName {}         -> ErrorWithoutFlag
-  QuotedNameWrongStage {} -> ErrorWithoutFlag
 
 thReifyErrorReason :: THReifyError -> DiagnosticReason
 thReifyErrorReason = \case
@@ -7071,7 +7129,6 @@ thSyntaxErrorHints = \case
 thNameErrorHints :: THNameError -> [GhcHint]
 thNameErrorHints = \case
   NonExactName {}         -> noHints
-  QuotedNameWrongStage {} -> noHints
 
 thReifyErrorHints :: THReifyError -> [GhcHint]
 thReifyErrorHints = \case
@@ -7446,7 +7503,7 @@ pprErrCtxtMsg = \case
        2 (pprTypedSplice mb_nm expr)
   TypedSpliceResultCtxt expr ->
     sep [ text "In the result of the splice:"
-        , nest 2 (pprTypedSplice Nothing expr)
+        , nest 2 (pprTypedSplice Nothing (HsTypedSpliceExpr noExtField expr))
         , text "To see what the splice expanded to, use -ddump-splices"]
 
   ReifyInstancesCtxt th_nm th_tys ->
@@ -7471,3 +7528,6 @@ pprErrCtxtMsg = \case
       text "in" <+> quotes (ppr req_uid) <> dot
 
 --------------------------------------------------------------------------------
+
+pprThBindLevel :: Set.Set ThLevelIndex -> SDoc
+pprThBindLevel levels_set = text "level" <> pluralSet levels_set <+> pprUnquotedSet levels_set

@@ -23,21 +23,22 @@
 -- ┌▽────────────┐    │                     │
 -- │HomeUnitGraph│    │                     │
 -- └┬────────────┘    │                     │
--- ┌▽─────────────────▽┐                    │
--- │UnitEnv            │                    │
--- └┬──────────────────┘                    │
--- ┌▽───────────────────────────────────────▽┐
--- │HscEnv                                   │
--- └─────────────────────────────────────────┘
+-- ┌▽─────────────────▽─────────────────────▽┐
+-- │UnitEnv                                  │
+-- └┬─────────────-──────────────────────────┘
+--  │
+--  │
+-- ┌▽──────────────────────────────────────▽┐
+-- │HscEnv                                  │
+-- └────────────────────────────────────────┘
 -- @
 --
--- The 'UnitEnv' references both the 'HomeUnitGraph' (with all the home unit
--- modules) and the 'ExternalPackageState' (information about all
--- non-home/external units). The 'HscEnv' references this 'UnitEnv' and the
--- 'ModuleGraph' (which describes the relationship between the modules being
--- compiled). The 'HomeUnitGraph' has one 'HomePackageTable' for every unit.
---
--- TODO: Arguably, the 'ModuleGraph' should be part of 'UnitEnv' rather than being in the 'HscEnv'.
+-- The 'UnitEnv' references the 'HomeUnitGraph' (with all the home unit
+-- modules), the 'ExternalPackageState' (information about all
+-- non-home/external units), and the 'ModuleGraph' (which describes the
+-- relationship between the modules being compiled).
+-- The 'HscEnv' references this 'UnitEnv'.
+-- The 'HomeUnitGraph' has one 'HomePackageTable' for every unit.
 module GHC.Unit.Env
     ( UnitEnv (..)
     , initUnitEnv
@@ -119,6 +120,7 @@ import GHC.Unit.Home.ModInfo
 import GHC.Unit.Home.PackageTable
 import GHC.Unit.Home.Graph (HomeUnitGraph, HomeUnitEnv)
 import qualified GHC.Unit.Home.Graph as HUG
+import GHC.Unit.Module.Graph
 
 import GHC.Platform
 import GHC.Settings
@@ -163,6 +165,10 @@ data UnitEnv = UnitEnv
 
     , ue_current_unit    :: UnitId
 
+    , ue_module_graph    :: ModuleGraph
+        -- ^ The module graph of the current session
+        -- See Note [Downsweep and the ModuleGraph] for when this is constructed.
+
     , ue_home_unit_graph :: !HomeUnitGraph
         -- See Note [Multiple Home Units]
 
@@ -182,6 +188,7 @@ initUnitEnv cur_unit hug namever platform = do
   return $ UnitEnv
     { ue_eps             = eps
     , ue_home_unit_graph = hug
+    , ue_module_graph    = emptyMG
     , ue_current_unit    = cur_unit
     , ue_platform        = platform
     , ue_namever         = namever
@@ -241,7 +248,7 @@ isUnitEnvInstalledModule ue m = maybe False (`isHomeInstalledModule` m) hu
 -- -------------------------------------------------------
 
 ue_findHomeUnitEnv :: HasDebugCallStack => UnitId -> UnitEnv -> HomeUnitEnv
-ue_findHomeUnitEnv uid e = case HUG.lookupHugUnit uid (ue_home_unit_graph e) of
+ue_findHomeUnitEnv uid e = case HUG.lookupHugUnitId uid (ue_home_unit_graph e) of
   Nothing -> pprPanic "Unit unknown to the internal unit environment"
               $  text "unit (" <> ppr uid <> text ")"
               $$ ppr (HUG.allUnits (ue_home_unit_graph e))
@@ -311,7 +318,7 @@ ue_unitHomeUnit uid = expectJust . ue_unitHomeUnit_maybe uid
 
 ue_unitHomeUnit_maybe :: UnitId -> UnitEnv -> Maybe HomeUnit
 ue_unitHomeUnit_maybe uid ue_env =
-  HUG.homeUnitEnv_home_unit =<< HUG.lookupHugUnit uid (ue_home_unit_graph ue_env)
+  HUG.homeUnitEnv_home_unit =<< HUG.lookupHugUnitId uid (ue_home_unit_graph ue_env)
 
 -- -------------------------------------------------------
 -- Query and modify the currently active unit
@@ -319,7 +326,7 @@ ue_unitHomeUnit_maybe uid ue_env =
 
 ue_currentHomeUnitEnv :: HasDebugCallStack => UnitEnv -> HomeUnitEnv
 ue_currentHomeUnitEnv e =
-  case HUG.lookupHugUnit (ue_currentUnit e) (ue_home_unit_graph e) of
+  case HUG.lookupHugUnitId (ue_currentUnit e) (ue_home_unit_graph e) of
     Just unitEnv -> unitEnv
     Nothing -> pprPanic "packageNotFound" $
       (ppr $ ue_currentUnit e) $$ ppr (HUG.allUnits (ue_home_unit_graph e))
@@ -389,7 +396,7 @@ ue_transitiveHomeDeps uid e =
 -- FIXME: Shouldn't this be a proper assertion only used in debug mode?
 assertUnitEnvInvariant :: HasDebugCallStack => UnitEnv -> UnitEnv
 assertUnitEnvInvariant u =
-  case HUG.lookupHugUnit (ue_current_unit u) (ue_home_unit_graph u) of
+  case HUG.lookupHugUnitId (ue_current_unit u) (ue_home_unit_graph u) of
     Just _ -> u
     Nothing ->
       pprPanic "invariant" (ppr (ue_current_unit u) $$ ppr (HUG.allUnits (ue_home_unit_graph u)))

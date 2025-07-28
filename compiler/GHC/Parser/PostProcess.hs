@@ -80,8 +80,10 @@ module GHC.Parser.PostProcess (
         ImpExpQcSpec(..),
         mkModuleImpExp,
         mkTypeImpExp,
+        mkDataImpExp,
         mkImpExpSubSpec,
         checkImportSpec,
+        warnPatternNamespaceSpecifier,
 
         -- Token symbols
         starSym,
@@ -92,6 +94,7 @@ module GHC.Parser.PostProcess (
         failOpFewArgs,
         failNotEnabledImportQualifiedPost,
         failImportQualifiedTwice,
+        failSpliceOrQuoteTwice,
 
         SumOrTuple (..),
 
@@ -815,22 +818,23 @@ mkGadtDecl loc names dcol ty = do
        let ((ops, cps), cs, arg_types, res_type) = splitHsFunType body_ty
        return (PrefixConGADT noExtField arg_types, res_type, (ops,cps), cs)
 
-  let bndrs_loc = case outer_bndrs of
-        HsOuterImplicit{} -> getLoc ty
-        HsOuterExplicit an _ -> EpAnn (entry an) noAnn emptyComments
-
   let l = EpAnn (spanAsAnchor loc) noAnn csa
 
   pure $ L l ConDeclGADT
                      { con_g_ext  = AnnConDeclGADT ops cps dcol
                      , con_names  = names
-                     , con_bndrs  = L bndrs_loc outer_bndrs
+                     , con_outer_bndrs = L outer_bndrs_loc outer_bndrs
+                     , con_inner_bndrs = inner_bndrs
                      , con_mb_cxt = mcxt
                      , con_g_args = args
                      , con_res_ty = res_ty
                      , con_doc    = Nothing }
   where
-    (outer_bndrs, mcxt, body_ty) = splitLHsGadtTy ty
+    (outer_bndrs, inner_bndrs, mcxt, body_ty) = splitLHsGadtTy ty
+    outer_bndrs_loc = case outer_bndrs of
+      HsOuterImplicit{} -> getLoc ty
+      HsOuterExplicit an _ -> EpAnn (entry an) noAnn emptyComments
+
 
 setRdrNameSpace :: RdrName -> NameSpace -> RdrName
 -- ^ This rather gruesome function is used mainly by the parser.
@@ -1276,8 +1280,11 @@ checkContextExpr orig_expr@(L (EpAnn l _ cs) _) =
 
 checkImportDecl :: Maybe (EpToken "qualified")
                 -> Maybe (EpToken "qualified")
-                -> P ()
-checkImportDecl mPre mPost = do
+                -> Maybe EpAnnLevel
+                -> Maybe EpAnnLevel
+                -> P ((Maybe (EpToken "qualified"), ImportDeclQualifiedStyle)
+                     , (Maybe EpAnnLevel, ImportDeclLevelStyle))
+checkImportDecl mPre mPost preLevel postLevel = do
   let whenJust mg f = maybe (pure ()) f mg
       tokenSpan tok = RealSrcSpan (epaLocationRealSrcSpan $ getEpTokenLoc tok) Strict.Nothing
 
@@ -1291,14 +1298,46 @@ checkImportDecl mPre mPost = do
 
   -- Error if 'qualified' occurs in both pre and postpositive
   -- positions.
-  whenJust mPost $ \post ->
-    when (isJust mPre) $
-      failImportQualifiedTwice (tokenSpan post)
+  qualSpec <- importDeclQualifiedStyle mPre mPost
+  levelSpec <- importDeclLevelStyle preLevel postLevel
 
   -- Warn if 'qualified' found in prepositive position and
   -- 'Opt_WarnPrepositiveQualifiedModule' is enabled.
   whenJust mPre $ \pre ->
     warnPrepositiveQualifiedModule (tokenSpan pre)
+
+  return (qualSpec, levelSpec)
+
+-- | Given two possible located 'qualified' tokens, compute a style
+-- (in a conforming Haskell program only one of the two can be not
+-- 'Nothing'). This is called from "GHC.Parser".
+importDeclQualifiedStyle :: Maybe (EpToken "qualified")
+                         -> Maybe (EpToken "qualified")
+                         -> P (Maybe (EpToken "qualified"), ImportDeclQualifiedStyle)
+importDeclQualifiedStyle mPre mPost =
+  case (mPre, mPost) of
+    (Just {}, Just post) -> failImportQualifiedTwice (getEpTokenSrcSpan post)
+                            >> return (Just post, QualifiedPost)
+    (Nothing, Just post) -> pure (Just post, QualifiedPost)
+    (Just pre, Nothing) -> pure (Just pre, QualifiedPre)
+    (Nothing, Nothing) -> pure (Nothing, NotQualified)
+
+importDeclLevelStyle :: (Maybe EpAnnLevel)
+                     -> (Maybe EpAnnLevel)
+                     -> P (Maybe EpAnnLevel, ImportDeclLevelStyle)
+importDeclLevelStyle preImportLevel postImportLevel =
+  case (preImportLevel, postImportLevel) of
+    (Just {}, Just tok) -> failSpliceOrQuoteTwice tok
+                            >> return (Just tok, LevelStylePost (tokToLevel tok))
+    (Nothing, Just post) -> pure (Just post, LevelStylePost (tokToLevel post))
+    (Just pre, Nothing) -> pure (Just pre, LevelStylePre (tokToLevel pre))
+    (Nothing, Nothing) -> pure (Nothing, NotLevelled)
+  where
+    tokToLevel tok = case tok of
+      EpAnnLevelSplice {} -> ImportDeclSplice
+      EpAnnLevelQuote {} -> ImportDeclQuote
+
+
 
 -- -------------------------------------------------------------------------
 -- Checking Patterns.
@@ -1897,7 +1936,7 @@ instance DisambECP (HsCmd GhcPs) where
   mkHsLitPV (L l a) = cmdFail l (ppr a)
   mkHsOverLitPV (L l a) = cmdFail (locA l) (ppr a)
   mkHsWildCardPV l = cmdFail l (text "_")
-  mkHsTySigPV l a sig _ = cmdFail (locA l) (ppr a <+> text "::" <+> ppr sig)
+  mkHsTySigPV l a sig _ = cmdFail (locA l) (ppr a <+> dcolon <+> ppr sig)
   mkHsExplicitListPV l xs _ = cmdFail l $
     brackets (pprWithCommas ppr xs)
   mkHsSplicePV (L l sp) = cmdFail l (pprUntypedSplice True Nothing sp)
@@ -3204,6 +3243,7 @@ data ImpExpSubSpec = ImpExpAbs
 
 data ImpExpQcSpec = ImpExpQcName (LocatedN RdrName)
                   | ImpExpQcType (EpToken "type") (LocatedN RdrName)
+                  | ImpExpQcData (EpToken "data") (LocatedN RdrName)
                   | ImpExpQcWildcard (EpToken "..") (EpToken ",")
 
 mkModuleImpExp :: Maybe (LWarningTxt GhcPs) -> (EpToken "(", EpToken ")") -> LocatedA ImpExpQcSpec
@@ -3249,11 +3289,13 @@ mkModuleImpExp warning (top, tcp) (L l specname) subs = do
 
     ieNameVal (ImpExpQcName ln)   = unLoc ln
     ieNameVal (ImpExpQcType _ ln) = unLoc ln
+    ieNameVal (ImpExpQcData _ ln) = unLoc ln
     ieNameVal ImpExpQcWildcard{}  = panic "ieNameVal got wildcard"
 
     ieNameFromSpec :: ImpExpQcSpec -> IEWrappedName GhcPs
     ieNameFromSpec (ImpExpQcName   (L l n)) = IEName noExtField (L l n)
     ieNameFromSpec (ImpExpQcType r (L l n)) = IEType r (L l n)
+    ieNameFromSpec (ImpExpQcData r (L l n)) = IEData r (L l n)
     ieNameFromSpec ImpExpQcWildcard{}       = panic "ieName got wildcard"
 
     wrapped = map (fmap ieNameFromSpec)
@@ -3263,6 +3305,12 @@ mkTypeImpExp :: LocatedN RdrName   -- TcCls or Var name space
 mkTypeImpExp name =
   do requireExplicitNamespaces (getLocA name)
      return (fmap (`setRdrNameSpace` tcClsName) name)
+
+mkDataImpExp :: LocatedN RdrName
+             -> P (LocatedN RdrName)
+mkDataImpExp name =
+  do requireExplicitNamespaces (getLocA name)
+     return name
 
 checkImportSpec :: LocatedLI [LIE GhcPs] -> P (LocatedLI [LIE GhcPs])
 checkImportSpec ie@(L _ specs) =
@@ -3302,6 +3350,14 @@ failImportQualifiedTwice :: SrcSpan -> P ()
 failImportQualifiedTwice loc =
   addError $ mkPlainErrorMsgEnvelope loc $ PsErrImportQualifiedTwice
 
+failSpliceOrQuoteTwice :: EpAnnLevel -> P ()
+failSpliceOrQuoteTwice lvl =
+  addError $ mkPlainErrorMsgEnvelope loc $ PsErrSpliceOrQuoteTwice
+  where
+    loc = case lvl of
+      EpAnnLevelSplice tok -> getEpTokenSrcSpan tok
+      EpAnnLevelQuote tok -> getEpTokenSrcSpan tok
+
 warnStarIsType :: SrcSpan -> P ()
 warnStarIsType span = addPsMessage span PsWarnStarIsType
 
@@ -3317,6 +3373,11 @@ requireExplicitNamespaces l = do
   allowed <- getBit ExplicitNamespacesBit
   unless allowed $
     addError $ mkPlainErrorMsgEnvelope l PsErrIllegalExplicitNamespace
+
+warnPatternNamespaceSpecifier :: MonadP m => SrcSpan -> m ()
+warnPatternNamespaceSpecifier l = do
+  explicit_namespaces <- getBit ExplicitNamespacesBit
+  addPsMessage l (PsWarnPatternNamespaceSpecifier explicit_namespaces)
 
 -----------------------------------------------------------------------------
 -- Misc utils

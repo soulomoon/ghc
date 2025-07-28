@@ -51,6 +51,7 @@ import GHC.Driver.Env
 import GHC.Driver.Plugins
 import GHC.Driver.DynFlags
 import GHC.Driver.Config.Diagnostic
+import GHC.IO.Unsafe ( unsafeInterleaveIO )
 
 import GHC.Tc.Errors.Hole.Plugin ( HoleFitPluginR (..) )
 import GHC.Tc.Errors.Types
@@ -119,7 +120,7 @@ import GHC.Core.TyCo.Ppr( debugPprType )
 import GHC.Core.TyCo.Tidy( tidyTopType )
 import GHC.Core.FamInstEnv
    ( FamInst, pprFamInst, famInstsRepTyCons, orphNamesOfFamInst
-   , famInstEnvElts, extendFamInstEnvList, normaliseType )
+   , famInstEnvElts, extendFamInstEnvList, normaliseType, emptyFamInstEnv, unionFamInstEnv )
 
 import GHC.Parser.Header       ( mkPrelImports )
 
@@ -150,7 +151,6 @@ import GHC.Types.Basic hiding( SuccessFlag(..) )
 import GHC.Types.Annotations
 import GHC.Types.SrcLoc
 import GHC.Types.SourceFile
-import GHC.Types.PkgQual
 import qualified GHC.LanguageExtensions as LangExt
 
 import GHC.Unit.Env as UnitEnv
@@ -164,6 +164,7 @@ import GHC.Unit.Module.ModSummary
 import GHC.Unit.Module.ModIface
 import GHC.Unit.Module.ModDetails
 import GHC.Unit.Module.Deps
+import GHC.Driver.Downsweep
 
 import GHC.Data.FastString
 import GHC.Data.Maybe
@@ -466,8 +467,8 @@ tcRnImports hsc_env import_decls
   = do  { (rn_imports, imp_user_spec, rdr_env, imports) <- rnImports import_decls
         -- Get the default declarations for the classes imported by this module
         -- and group them by class.
-        ; tc_defaults <-(NE.groupBy ((==) `on` cd_class) . (concatMap defaultList))
-                        <$> tcGetClsDefaults (M.keys $ imp_mods imports)
+        ; tc_defaults <- NE.groupBy ((==) `on` cd_class) . (concatMap defaultList)
+                         <$> tcGetClsDefaults (M.keys $ imp_mods imports)
         ; this_mod <- getModule
         ; gbl_env <- getGblEnv
         ; let unitId = homeUnitId $ hsc_home_unit hsc_env
@@ -479,8 +480,16 @@ tcRnImports hsc_env import_decls
                 -- filtering also ensures that we don't see instances from
                 -- modules batch (@--make@) compiled before this one, but
                 -- which are not below this one.
-              ; (home_insts, home_fam_insts) <- liftIO $
+              ; (home_insts, home_mod_fam_inst_env) <- liftIO $
                     hugInstancesBelow hsc_env unitId mnwib
+              ; let home_fam_inst_env = foldl' unionFamInstEnv emptyFamInstEnv $ snd <$> home_mod_fam_inst_env
+              ; let hpt_fam_insts = mkModuleEnv home_mod_fam_inst_env
+
+                -- We use 'unsafeInterleaveIO' to avoid redundant memory allocations
+                -- See Note [Lazily loading COMPLETE pragmas] from GHC.HsToCore.Monad
+                -- and see https://gitlab.haskell.org/ghc/ghc/-/merge_requests/14274#note_620545
+              ; completeSigsBelow <- liftIO $ unsafeInterleaveIO $
+                    hugCompleteSigsBelow hsc_env unitId mnwib
 
                 -- Record boot-file info in the EPS, so that it's
                 -- visible to loadHiBootInterface in tcRnSrcDecls,
@@ -494,12 +503,13 @@ tcRnImports hsc_env import_decls
             gbl {
               tcg_rdr_env      = tcg_rdr_env gbl `plusGlobalRdrEnv` rdr_env,
               tcg_imports      = tcg_imports gbl `plusImportAvails` imports,
+              tcg_complete_match_env = tcg_complete_match_env gbl ++
+                                       completeSigsBelow,
               tcg_import_decls = imp_user_spec,
               tcg_rn_imports   = rn_imports,
               tcg_default      = foldMap subsume tc_defaults,
               tcg_inst_env     = tcg_inst_env gbl `unionInstEnv` home_insts,
-              tcg_fam_inst_env = extendFamInstEnvList (tcg_fam_inst_env gbl)
-                                                      home_fam_insts
+              tcg_fam_inst_env = unionFamInstEnv (tcg_fam_inst_env gbl) home_fam_inst_env
             }) $ do {
 
         ; traceRn "rn1" (ppr (imp_direct_dep_mods imports))
@@ -529,7 +539,7 @@ tcRnImports hsc_env import_decls
                              $ imports }
         ; logger <- getLogger
         ; withTiming logger (text "ConsistencyCheck"<+>brackets (ppr this_mod)) (const ())
-            $ checkFamInstConsistency dir_imp_mods
+            $ checkFamInstConsistency hpt_fam_insts dir_imp_mods
         ; traceRn "rn1: } checking family instance consistency" empty
 
         ; gbl_env <- getGblEnv
@@ -2069,6 +2079,25 @@ exist. For this logic see GHC.IfaceToCore.mk_top_id.
 There is also some similar (probably dead) logic in GHC.Rename.Env which says it
 was added for External Core which faced a similar issue.
 
+Note [runTcInteractive module graph]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The `withInteractiveModuleNode` function sets up the module graph which contains
+the interactive module used by `runTcInteractive`.
+
+The module graph is essentially the ambient module graph which is set up when
+ghci loads a module using `load`, with the addition of the interactive module (Ghci<N>),
+which imports the parts specified by the `InteractiveImports`.
+
+Therefore `downsweepInteractiveImports` presumes that any import which is
+determined to be from the home module is already present in the module graph.
+This saves resummarising and performing the whole downsweep again if it's already been
+done.
+
+On the other hand, when GHCi starts up, and no modules have been loaded yet, the
+module graph will be empty. Therefore `downsweepInteractiveImports` will perform
+for the unit portion of the graph, if it's not already been performed.
+
 
 *********************************************************
 *                                                       *
@@ -2077,12 +2106,20 @@ was added for External Core which faced a similar issue.
 *********************************************************
 -}
 
+-- See Note [runTcInteractive module graph]
+withInteractiveModuleNode :: HscEnv -> TcM a -> TcM a
+withInteractiveModuleNode hsc_env thing_inside = do
+  mg <- liftIO $ downsweepInteractiveImports hsc_env (hsc_IC hsc_env)
+  updTopEnv (setModuleGraph mg) thing_inside
+
+
 runTcInteractive :: HscEnv -> TcRn a -> IO (Messages TcRnMessage, Maybe a)
 -- Initialise the tcg_inst_env with instances from all home modules.
 -- This mimics the more selective call to hptInstances in tcRnImports
 runTcInteractive hsc_env thing_inside
   = initTcInteractive hsc_env $ withTcPlugins hsc_env $
     withDefaultingPlugins hsc_env $ withHoleFitPlugins hsc_env $
+    withInteractiveModuleNode hsc_env $
     do { traceTc "setInteractiveContext" $
             vcat [ text "ic_tythings:" <+> vcat (map ppr (ic_tythings icxt))
                  , text "ic_insts:" <+> vcat (map (pprBndr LetBind . instanceDFunId) (instEnvElts ic_insts))
@@ -2091,15 +2128,18 @@ runTcInteractive hsc_env thing_inside
                                                  , let local_gres = filter isLocalGRE gres
                                                  , not (null local_gres) ]) ]
 
-       ; let getOrphans m mb_pkg = fmap (\iface -> mi_module iface
-                                          : dep_orphs (mi_deps iface))
-                                 (loadSrcInterface (text "runTcInteractive") m
-                                                   NotBoot mb_pkg)
+       ; let getOrphansForModuleName m mb_pkg = do
+              iface <- loadSrcInterface (text "runTcInteractive") m NotBoot mb_pkg
+              pure $ mi_module iface : dep_orphs (mi_deps iface)
+
+             getOrphansForModule m = do
+              iface <- loadModuleInterface (text "runTcInteractive") m
+              pure $ mi_module iface : dep_orphs (mi_deps iface)
 
        ; !orphs <- fmap (force . concat) . forM (ic_imports icxt) $ \i ->
             case i of                   -- force above: see #15111
-                IIModule n -> getOrphans n NoPkgQual
-                IIDecl i   -> getOrphans (unLoc (ideclName i))
+                IIModule n -> getOrphansForModule n
+                IIDecl i   -> getOrphansForModuleName (unLoc (ideclName i))
                                          (renameRawPkgQual (hsc_unit_env hsc_env) (unLoc $ ideclName i) (ideclPkgQual i))
 
 

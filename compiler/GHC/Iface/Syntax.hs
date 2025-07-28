@@ -74,6 +74,7 @@ import GHC.Types.Avail
 import GHC.Types.ForeignCall
 import GHC.Types.Annotations( AnnPayload, AnnTarget )
 import GHC.Types.Basic
+import GHC.Types.Tickish
 import GHC.Unit.Module
 import GHC.Unit.Module.Warnings
 import GHC.Types.SrcLoc
@@ -333,7 +334,7 @@ data IfaceConDecl
         -- So this guarantee holds for IfaceConDecl, but *not* for DataCon
 
         ifConExTCvs   :: [IfaceBndr],  -- Existential ty/covars
-        ifConUserTvBinders :: [IfaceForAllSpecBndr],
+        ifConUserTvBinders :: [IfaceForAllBndr],
           -- The tyvars, in the order the user wrote them
           -- INVARIANT: the set of tyvars in ifConUserTvBinders is exactly the
           --            set of tyvars (*not* covars) of ifConExTCvs, unioned
@@ -699,7 +700,7 @@ data IfaceTickish
   = IfaceHpcTick    Module Int               -- from HpcTick x
   | IfaceSCC        CostCentre Bool Bool     -- from ProfNote
   | IfaceSource  RealSrcSpan FastString      -- from SourceNote
-  | IfaceBreakpoint Int [IfaceExpr] Module   -- from Breakpoint
+  | IfaceBreakpoint BreakpointId [IfaceExpr] -- from Breakpoint
 
 data IfaceAlt = IfaceAlt IfaceConAlt [IfLclName] IfaceExpr
         -- Note: IfLclName, not IfaceBndr (and same with the case binder)
@@ -1377,7 +1378,7 @@ pprIfaceDecl ss decl@(IfaceFamily { ifName = tycon
 
     pp_inj_cond res inj = case filterByList inj binders of
        []  -> empty
-       tvs -> hsep [vbar, ppr res, text "->", interppSP (map ifTyConBinderName tvs)]
+       tvs -> hsep [vbar, ppr res, arrow, interppSP (map ifTyConBinderName tvs)]
 
     pp_rhs IfaceDataFamilyTyCon
       = ppShowIface ss (text "data")
@@ -1464,7 +1465,7 @@ pprRoles suppress_if tyCon bndrs roles
          text "type role" <+> tyCon <+> hsep (map ppr froles)
 
 pprStandaloneKindSig :: SDoc -> IfaceType -> SDoc
-pprStandaloneKindSig tyCon ty = text "type" <+> tyCon <+> text "::" <+> ppr ty
+pprStandaloneKindSig tyCon ty = text "type" <+> tyCon <+> dcolon <+> ppr ty
 
 pprInfixIfDeclBndr :: ShowHowMuch -> OccName -> SDoc
 pprInfixIfDeclBndr (ShowSome _ (AltPpr (Just ppr_bndr))) name
@@ -1569,9 +1570,9 @@ pprIfaceConDecl ss gadt_style tycon tc_binders parent
     -- the visibilities of the existential tyvar binders, we can simply drop
     -- the universal tyvar binders from user_tvbs.
     ex_tvbs = dropList tc_binders user_tvbs
-    ppr_ex_quant = pprIfaceForAllPartMust (ifaceForAllSpecToBndrs ex_tvbs) ctxt
+    ppr_ex_quant = pprIfaceForAllPartMust ex_tvbs ctxt
     pp_gadt_res_ty = mk_user_con_res_ty eq_spec
-    ppr_gadt_ty = pprIfaceForAllPart (ifaceForAllSpecToBndrs user_tvbs) ctxt pp_tau
+    ppr_gadt_ty = pprIfaceForAllPart user_tvbs ctxt pp_tau
 
         -- A bit gruesome this, but we can't form the full con_tau, and ppr it,
         -- because we don't have a Name for the tycon, only an OccName
@@ -1848,7 +1849,7 @@ pprIfaceTickish (IfaceSCC cc tick scope)
   = braces (pprCostCentreCore cc <+> ppr tick <+> ppr scope)
 pprIfaceTickish (IfaceSource src _names)
   = braces (pprUserRealSpan True src)
-pprIfaceTickish (IfaceBreakpoint m ix fvs)
+pprIfaceTickish (IfaceBreakpoint (BreakpointId m ix) fvs)
   = braces (text "break" <+> ppr m <+> ppr ix <+> ppr fvs)
 
 ------------------
@@ -2198,7 +2199,7 @@ freeNamesIfaceTyConParent (IfDataInstance ax tc tys)
   = unitNameSet ax &&& freeNamesIfTc tc &&& freeNamesIfAppArgs tys
 
 freeNamesIfTickish :: IfaceTickish -> NameSet
-freeNamesIfTickish (IfaceBreakpoint _ fvs _) =
+freeNamesIfTickish (IfaceBreakpoint _ fvs) =
   fnList freeNamesIfExpr fvs
 freeNamesIfTickish _ = emptyNameSet
 
@@ -2919,7 +2920,7 @@ instance Binary IfaceTickish where
         put_ bh (srcSpanEndLine src)
         put_ bh (srcSpanEndCol src)
         put_ bh name
-    put_ bh (IfaceBreakpoint m ix fvs) = do
+    put_ bh (IfaceBreakpoint (BreakpointId m ix) fvs) = do
         putByte bh 3
         put_ bh m
         put_ bh ix
@@ -2947,7 +2948,7 @@ instance Binary IfaceTickish where
             3 -> do m <- get bh
                     ix <- get bh
                     fvs <- get bh
-                    return (IfaceBreakpoint m ix fvs)
+                    return (IfaceBreakpoint (BreakpointId m ix) fvs)
             _ -> panic ("get IfaceTickish " ++ show h)
 
 instance Binary IfaceConAlt where
@@ -3206,7 +3207,7 @@ instance NFData IfaceTickish where
     IfaceHpcTick m i -> rnf m `seq` rnf i
     IfaceSCC cc b1 b2 -> rnf cc `seq` rnf b1 `seq` rnf b2
     IfaceSource src str -> rnf src `seq` rnf str
-    IfaceBreakpoint m i fvs -> rnf m `seq` rnf i `seq` rnf fvs
+    IfaceBreakpoint i fvs -> rnf i `seq` rnf fvs
 
 instance NFData IfaceConAlt where
   rnf = \case

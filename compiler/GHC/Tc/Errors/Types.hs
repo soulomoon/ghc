@@ -99,7 +99,7 @@ module GHC.Tc.Errors.Types (
   , RuleLhsErrReason(..)
   , HsigShapeMismatchReason(..)
   , WrongThingSort(..)
-  , StageCheckReason(..)
+  , LevelCheckReason(..)
   , UninferrableTyVarCtx(..)
   , PatSynInvalidRhsReason(..)
   , BadFieldAnnotationReason(..)
@@ -115,6 +115,7 @@ module GHC.Tc.Errors.Types (
   , TySynCycleTyCons
   , BadImportKind(..)
   , DodgyImportsReason (..)
+  , ImportLookupExtensions (..)
   , ImportLookupReason (..)
   , UnusedImportReason (..)
   , UnusedImportName (..)
@@ -254,6 +255,7 @@ import Data.Map.Strict (Map)
 
 import GHC.Generics ( Generic )
 
+import qualified Data.Set as Set
 
 data TcRnMessageOpts = TcRnMessageOpts { tcOptsShowContext :: !Bool -- ^ Whether we show the error context or not
                                        , tcOptsIfaceOpts   :: !IfaceMessageOpts
@@ -2551,11 +2553,11 @@ data TcRnMessage where
                   rename/should_fail/T22478e
                   th/TH_Promoted1Tuple
                   typecheck/should_compile/tcfail094
-                  typecheck/should_compile/T22141a
-                  typecheck/should_compile/T22141b
-                  typecheck/should_compile/T22141c
-                  typecheck/should_compile/T22141d
-                  typecheck/should_compile/T22141e
+                  typecheck/should_fail/T22141a
+                  typecheck/should_fail/T22141b
+                  typecheck/should_fail/T22141c
+                  typecheck/should_fail/T22141d
+                  typecheck/should_fail/T22141e
                   typecheck/should_compile/T22141f
                   typecheck/should_compile/T22141g
                   typecheck/should_fail/T20873c
@@ -2583,21 +2585,6 @@ data TcRnMessage where
                 typecheck/should_fail/TyAppPat_PatternBindingExistential
   -}
   TcRnCannotBindTyVarsInPatBind :: !(NE.NonEmpty (Name, TcTyVar)) -> TcRnMessage
-
-  {-| TcRnTooManyTyArgsInConPattern is an error occurring when a constructor pattern
-     has more than the expected number of type arguments
-
-     Example(s):
-     f (Just @Int @Bool x) = x
-
-    Test cases: typecheck/should_fail/TyAppPat_TooMany
-                typecheck/should_fail/T20443b
-  -}
-  TcRnTooManyTyArgsInConPattern
-    :: !ConLike
-    -> !Int -- ^ Expected number of args
-    -> !Int -- ^ Actual number of args
-    -> TcRnMessage
 
   {-| TcRnMultipleInlinePragmas is a warning signifying that multiple inline pragmas
      reference the same definition.
@@ -3486,41 +3473,33 @@ data TcRnMessage where
     -> !LookupInstanceErrReason
     -> TcRnMessage
 
-  {-| TcRnBadlyStaged is an error that occurs when a TH binding is used in an
-    invalid stage.
+  {-| TcRnBadlyLevelled is an error that occurs when a TH binding is used at an
+      invalid level.
 
     Test cases:
-      T17820d
+      T17820d, T17820, T21547, T5795, qq00[1-4], annfail0{3,4,6,9}
   -}
-  TcRnBadlyStaged
-    :: !StageCheckReason -- ^ The binding being spliced.
-    -> !Int -- ^ The binding stage.
-    -> !Int -- ^ The stage at which the binding is used.
+  TcRnBadlyLevelled
+    :: !LevelCheckReason -- ^ The binding
+    -> !(Set.Set ThLevelIndex) -- ^ The binding levels
+    -> !ThLevelIndex -- ^ The level at which the binding is used.
+    -> !(Maybe ErrorItem) -- ^ The attempt we made to implicitly lift the binding.
+    -> DiagnosticReason   -- ^ Whether to defer this error or fail
     -> TcRnMessage
 
-  {-| TcRnStageRestriction is an error that occurs when a top level splice refers to
-    a local name.
-
-    Test cases:
-      T17820, T21547, T5795, qq00[1-4], annfail0{3,4,6,9}
-  -}
-  TcRnStageRestriction
-    :: !StageCheckReason -- ^ The binding being spliced.
-    -> TcRnMessage
-
-  {-| TcRnBadlyStagedWarn is a warning that occurs when a TH type binding is
+  {-| TcRnBadlyLevelledWarn is a warning that occurs when a TH type binding is
     used in an invalid stage.
 
     Controlled by flags:
-       - Wbadly-staged-type
+       - Wbadly-levelled-type
 
     Test cases:
       T23829_timely T23829_tardy T23829_hasty
   -}
-  TcRnBadlyStagedType
+  TcRnBadlyLevelledType
     :: !Name  -- ^ The type binding being spliced.
-    -> !Int -- ^ The binding stage.
-    -> !Int -- ^ The stage at which the binding is used.
+    -> !(Set.Set ThLevelIndex) -- ^ The binding stage.
+    -> !ThLevelIndex -- ^ The stage at which the binding is used.
     -> TcRnMessage
 
   {-| TcRnTyThingUsedWrong is an error that occurs when a thing is used where another
@@ -5592,17 +5571,6 @@ data TcSolverReportMsg
    -- See 'FixedRuntimeRepErrorInfo' and 'FixedRuntimeRepContext' for more information.
   | FixedRuntimeRepError [FixedRuntimeRepErrorInfo]
 
-  -- | An equality between two types is blocked on a kind equality
-  -- between their kinds.
-  --
-  -- Test cases: none.
-  | BlockedEquality ErrorItem
-    -- These are for the "blocked" equalities, as described in
-    -- Note [Equalities with incompatible kinds] in GHC.Tc.Solver.Equality,
-    -- wrinkle (EIK2). There should always be another unsolved wanted around,
-    -- which will ordinarily suppress this message. But this can still be printed out
-    -- with -fdefer-type-errors (sigh), so we must produce a message.
-
   -- | Something was not applied to sufficiently many arguments.
   --
   --  Example:
@@ -5841,15 +5809,39 @@ data BadImportKind
   -- | Missing @type@ keyword when importing a type.
   -- e.g.  `import TypeLits( (+) )`, where TypeLits exports a /type/ (+), not a /term/ (+)
   -- Then we want to suggest using `import TypeLits( type (+) )`
-  | BadImportAvailTyCon Bool -- ^ is ExplicitNamespaces enabled?
+  | BadImportAvailTyCon
   -- | Trying to import a data constructor directly, e.g.
   -- @import Data.Maybe (Just)@ instead of @import Data.Maybe (Maybe(Just))@
   | BadImportAvailDataCon OccName
   -- | The parent does not export the given children.
-  | BadImportNotExportedSubordinates [OccName]
+  | BadImportNotExportedSubordinates !GlobalRdrElt (NonEmpty FastString)
+  -- | Incorrect @type@ keyword when importing subordinates that aren't types.
+  | BadImportNonTypeSubordinates !GlobalRdrElt (NonEmpty GlobalRdrElt)
+  -- | Incorrect @data@ keyword when importing something which isn't a term.
+  | BadImportNonDataSubordinates !GlobalRdrElt (NonEmpty GlobalRdrElt)
   -- | Incorrect @type@ keyword when importing something which isn't a type.
   | BadImportAvailVar
   deriving Generic
+
+{- Note [Reasons for BadImportAvailTyCon]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+BadImportAvailTyCon means a name is available in the TcCls namespace
+but name resolution could not use it. Possible reasons for that:
+
+- Case (TyOp) `import M ((#))` or `import M (data (#))`
+    The user tried to import a type operator without using the `type` keyword,
+    or using a different keyword. Suggested fix: add 'type'.
+
+- Case (DataKw) `import M (data T)`
+    The user tried to import a non-operator type constructor, but mistakenly
+    used the `data` keyword, which restricted the lookup to the value namespace.
+    Suggested fix: remove 'data'; no need to add 'type' for non-operators.
+
+- Case (PatternKw) `import M (pattern T)`
+    Same as the (DataKw) case, mutatis mutandis.
+
+Any other case would not have resulted in BadImportAvailTyCon.
+-}
 
 -- | Describes what category of subordinate we are dealing with, e.g.
 -- a method of a class, a field of a record, etc.
@@ -6097,6 +6089,10 @@ data FixedRuntimeRepErrorInfo
   , frr_info_not_concrete :: Maybe (TcTyVar, TcType)
       -- ^ Which non-concrete type did we try to
       -- unify this concrete type variable with?
+  , frr_info_other_origin :: Maybe CtOrigin
+      -- ^ Did the representation polymorphism check arise
+      -- from another constraint? If so, record that 'CtOrigin' here
+      -- (it will never be a 'FRROrigin').
   }
 
 {-
@@ -6244,9 +6240,9 @@ data WrongThingSort
   | WrongThingTyCon
   | WrongThingAxiom
 
-data StageCheckReason
-  = StageCheckInstance !InstanceWhat !PredType
-  | StageCheckSplice !Name
+data LevelCheckReason
+  = LevelCheckInstance !InstanceWhat !PredType
+  | LevelCheckSplice !Name !(Maybe GlobalRdrElt)
 
 data UninferrableTyVarCtx
   = UninfTyCtx_ClassContext [TcType]
@@ -6275,13 +6271,28 @@ data BadFieldAnnotationReason where
     T14761a, T7562
   -}
   UnpackWithoutStrictness :: BadFieldAnnotationReason
-  {-| An UNPACK pragma was applied to an abstract type in an indefinite package
-    in Backpack.
+  {-| An UNPACK pragma is unusable.
+
+    A possible reason for this warning is that the UNPACK pragma was applied to
+    one of the following:
+
+      * a function type @a -> b@
+      * a recursive use of the data type being defined
+      * a sum type that cannot be unpacked, see @Note [UNPACK for sum types]@
+      * a type/data family application with no matching instance in the environment
+
+    However, it is deliberately /not/ emitted if:
+
+      * the failure occurs in an indefinite package in Backpack
+      * the pragma is usable, but unpacking is disabled by @-O0@
 
     Test cases:
-    unpack_sums_5, T3966, T7050
+      unpack_sums_5, T3966, T7050, T25672, T23307c
+
+    Negative test cases (must not trigger this warning):
+      T3990
   -}
-  BackpackUnpackAbstractType :: BadFieldAnnotationReason
+  UnusableUnpackPragma :: BadFieldAnnotationReason
   deriving (Generic)
 
 data SuperclassCycle =
@@ -6381,6 +6392,14 @@ data DodgyImportsReason =
   DodgyImportsHiding !ImportLookupReason
   deriving (Generic)
 
+-- | What extensions were enabled at import site.
+data ImportLookupExtensions =
+  ImportLookupExtensions
+    { ile_pattern_synonyms    :: !Bool
+    , ile_explicit_namespaces :: !Bool
+    }
+  deriving (Generic)
+
 -- | Different types of errors for import lookup.
 data ImportLookupReason where
   {-| An item in an import statement is not exported by the corresponding
@@ -6394,7 +6413,7 @@ data ImportLookupReason where
                   -> ModIface
                   -> ImpDeclSpec
                   -> IE GhcPs
-                  -> Bool -- ^ whether @-XPatternSynonyms@ was enabled
+                  -> ImportLookupExtensions
                   -> ImportLookupReason
   {-| A name is specified with a qualifying module.
 
@@ -6744,13 +6763,6 @@ data THNameError
   -}
   = NonExactName !RdrName
 
-  {-| QuotedNameWrongStage is an error that can happen when a
-      (non-top-level) Name is used at a different Template Haskell stage
-      than the stage at which it is bound.
-
-     Test cases: T16976z
-  -}
-  | QuotedNameWrongStage !(HsQuote GhcPs)
   deriving Generic
 
 data THReifyError
@@ -6964,6 +6976,7 @@ data LookupTHInstNameErrReason
 data UnrepresentableTypeDescr
   = LinearInvisibleArgument
   | CoercionsInTypes
+  | DataConVisibleForall
 
 -- FFI error types
 data IllegalForeignTypeReason

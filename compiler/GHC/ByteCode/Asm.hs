@@ -28,8 +28,6 @@ import GHC.Prelude hiding ( any )
 import GHC.ByteCode.Instr
 import GHC.ByteCode.InfoTable
 import GHC.ByteCode.Types
-import GHCi.RemoteTypes
-import GHC.Runtime.Interpreter
 import GHC.Runtime.Heap.Layout ( fromStgWord, StgWord )
 
 import GHC.Types.Name
@@ -38,6 +36,7 @@ import GHC.Types.Literal
 import GHC.Types.Unique.DSet
 import GHC.Types.SptEntry
 import GHC.Types.Unique.FM
+import GHC.Unit.Types
 
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
@@ -52,6 +51,7 @@ import GHC.Cmm.Reg             ( GlobalArgRegs(..) )
 import GHC.Cmm.CallConv        ( allArgRegsCover )
 import GHC.Platform
 import GHC.Platform.Profile
+import Language.Haskell.Syntax.Module.Name
 
 import Control.Monad
 import qualified Control.Monad.Trans.State.Strict as MTL
@@ -65,6 +65,7 @@ import Data.Array.Base  ( unsafeWrite )
 #endif
 
 import Foreign hiding (shiftL, shiftR)
+import Data.ByteString (ByteString)
 import Data.Char  (ord)
 import Data.Maybe (fromMaybe)
 import GHC.Float (castFloatToWord32, castDoubleToWord64)
@@ -104,24 +105,21 @@ bcoFreeNames bco
 
 -- Top level assembler fn.
 assembleBCOs
-  :: Interp
-  -> Profile
+  :: Profile
   -> FlatBag (ProtoBCO Name)
   -> [TyCon]
-  -> AddrEnv
-  -> Maybe ModBreaks
+  -> [(Name, ByteString)]
+  -> Maybe InternalModBreaks
   -> [SptEntry]
   -> IO CompiledByteCode
-assembleBCOs interp profile proto_bcos tycons top_strs modbreaks spt_entries = do
+assembleBCOs profile proto_bcos tycons top_strs modbreaks spt_entries = do
   -- TODO: the profile should be bundled with the interpreter: the rts ways are
   -- fixed for an interpreter
-  itblenv <- mkITbls interp profile tycons
+  let itbls = mkITbls profile tycons
   bcos    <- mapM (assembleBCO (profilePlatform profile)) proto_bcos
-  bcos'   <- mallocStrings interp bcos
   return CompiledByteCode
-    { bc_bcos = bcos'
-    , bc_itbls = itblenv
-    , bc_ffis = concatMap protoBCOFFIs proto_bcos
+    { bc_bcos = bcos
+    , bc_itbls = itbls
     , bc_strs = top_strs
     , bc_breaks = modbreaks
     , bc_spt_entries = spt_entries
@@ -137,50 +135,17 @@ assembleBCOs interp profile proto_bcos tycons top_strs modbreaks spt_entries = d
 -- memory for them, and bake the resulting addresses into the instruction stream
 -- in the form of BCONPtrWord arguments.
 --
--- Since we do this when assembling, we only allocate the memory when we compile
--- the module, not each time we relink it. However, we do want to take care to
--- malloc the memory all in one go, since that is more efficient with
--- -fexternal-interpreter, especially when compiling in parallel.
+-- We used to allocate remote buffers for BCONPtrStr ByteStrings when
+-- assembling, but this gets in the way of bytecode serialization: we
+-- want the ability to serialize and reload assembled bytecode, so
+-- it's better to preserve BCONPtrStr as-is, and only perform the
+-- actual allocation at link-time.
 --
 -- Note that, as with top-level string literal bindings, this memory is never
 -- freed, so it just leaks if the BCO is unloaded. See Note [Generating code for
 -- top-level string literal bindings] in GHC.StgToByteCode for some discussion
 -- about why.
 --
-mallocStrings ::  Interp -> FlatBag UnlinkedBCO -> IO (FlatBag UnlinkedBCO)
-mallocStrings interp ulbcos = do
-  let bytestrings = reverse (MTL.execState (mapM_ collect ulbcos) [])
-  ptrs <- interpCmd interp (MallocStrings bytestrings)
-  return (MTL.evalState (mapM splice ulbcos) ptrs)
- where
-  splice bco@UnlinkedBCO{..} = do
-    lits <- mapM spliceLit unlinkedBCOLits
-    ptrs <- mapM splicePtr unlinkedBCOPtrs
-    return bco { unlinkedBCOLits = lits, unlinkedBCOPtrs = ptrs }
-
-  spliceLit (BCONPtrStr _) = do
-    rptrs <- MTL.get
-    case rptrs of
-      (RemotePtr p : rest) -> do
-        MTL.put rest
-        return (BCONPtrWord (fromIntegral p))
-      _ -> panic "mallocStrings:spliceLit"
-  spliceLit other = return other
-
-  splicePtr (BCOPtrBCO bco) = BCOPtrBCO <$> splice bco
-  splicePtr other = return other
-
-  collect UnlinkedBCO{..} = do
-    mapM_ collectLit unlinkedBCOLits
-    mapM_ collectPtr unlinkedBCOPtrs
-
-  collectLit (BCONPtrStr bs) = do
-    strs <- MTL.get
-    MTL.put (bs:strs)
-  collectLit _ = return ()
-
-  collectPtr (BCOPtrBCO bco) = collect bco
-  collectPtr _ = return ()
 
 data RunAsmReader = RunAsmReader { isn_array :: {-# UNPACK #-} !(Array.IOUArray Int Word16)
                                   , ptr_array :: {-# UNPACK #-} !(SmallMutableArrayIO BCOPtr)
@@ -266,7 +231,13 @@ assembleBCO platform
 
   let !insns_arr =  mkBCOByteArray $ final_isn_array
       !bitmap_arr = mkBCOByteArray $ mkBitmapArray bsize bitmap
-      ul_bco = UnlinkedBCO nm arity insns_arr bitmap_arr (fromSmallArray final_lit_array) (fromSmallArray final_ptr_array)
+      ul_bco = UnlinkedBCO { unlinkedBCOName = nm
+                           , unlinkedBCOArity = arity
+                           , unlinkedBCOInstrs = insns_arr
+                           , unlinkedBCOBitmap = bitmap_arr
+                           , unlinkedBCOLits = fromSmallArray final_lit_array
+                           , unlinkedBCOPtrs = fromSmallArray final_ptr_array
+                           }
 
   -- 8 Aug 01: Finalisers aren't safe when attached to non-primitive
   -- objects, since they might get run too early.  Disable this until
@@ -275,6 +246,7 @@ assembleBCO platform
 
   return ul_bco
 
+-- | Construct a word-array containing an @StgLargeBitmap@.
 mkBitmapArray :: Word -> [StgWord] -> UArray Int Word
 -- Here the return type must be an array of Words, not StgWords,
 -- because the underlying ByteArray# will end up as a component
@@ -729,19 +701,167 @@ assembleI platform i = case i of
   ENTER                    -> emit_ bci_ENTER []
   RETURN rep               -> emit_ (return_non_tuple rep) []
   RETURN_TUPLE             -> emit_ bci_RETURN_T []
-  CCALL off m_addr i       -> do np <- addr m_addr
+  CCALL off ffi i          -> do np <- lit1 $ BCONPtrFFIInfo ffi
                                  emit_ bci_CCALL [wOp off, Op np, SmallOp i]
   PRIMCALL                 -> emit_ bci_PRIMCALL []
-  BRK_FUN arr tick_mod tickx info_mod infox cc ->
-                              do p1 <- ptr (BCOPtrBreakArray arr)
-                                 tick_addr <- addr tick_mod
-                                 info_addr <- addr info_mod
-                                 np <- addr cc
-                                 emit_ bci_BRK_FUN [ Op p1
-                                                  , Op tick_addr, Op info_addr
-                                                  , SmallOp tickx, SmallOp infox
-                                                  , Op np
-                                                  ]
+
+  OP_ADD w -> case w of
+    W64                   -> emit_ bci_OP_ADD_64 []
+    W32                   -> emit_ bci_OP_ADD_32 []
+    W16                   -> emit_ bci_OP_ADD_16 []
+    W8                    -> emit_ bci_OP_ADD_08 []
+    _                     -> unsupported_width
+  OP_SUB w -> case w of
+    W64                   -> emit_ bci_OP_SUB_64 []
+    W32                   -> emit_ bci_OP_SUB_32 []
+    W16                   -> emit_ bci_OP_SUB_16 []
+    W8                    -> emit_ bci_OP_SUB_08 []
+    _                     -> unsupported_width
+  OP_AND w -> case w of
+    W64                   -> emit_ bci_OP_AND_64 []
+    W32                   -> emit_ bci_OP_AND_32 []
+    W16                   -> emit_ bci_OP_AND_16 []
+    W8                    -> emit_ bci_OP_AND_08 []
+    _                     -> unsupported_width
+  OP_XOR w -> case w of
+    W64                   -> emit_ bci_OP_XOR_64 []
+    W32                   -> emit_ bci_OP_XOR_32 []
+    W16                   -> emit_ bci_OP_XOR_16 []
+    W8                    -> emit_ bci_OP_XOR_08 []
+    _                     -> unsupported_width
+  OP_OR w -> case w of
+    W64                    -> emit_ bci_OP_OR_64 []
+    W32                    -> emit_ bci_OP_OR_32 []
+    W16                    -> emit_ bci_OP_OR_16 []
+    W8                     -> emit_ bci_OP_OR_08 []
+    _                      -> unsupported_width
+  OP_NOT w -> case w of
+    W64                   -> emit_ bci_OP_NOT_64 []
+    W32                   -> emit_ bci_OP_NOT_32 []
+    W16                   -> emit_ bci_OP_NOT_16 []
+    W8                    -> emit_ bci_OP_NOT_08 []
+    _                     -> unsupported_width
+  OP_NEG w -> case w of
+    W64                   -> emit_ bci_OP_NEG_64 []
+    W32                   -> emit_ bci_OP_NEG_32 []
+    W16                   -> emit_ bci_OP_NEG_16 []
+    W8                    -> emit_ bci_OP_NEG_08 []
+    _                     -> unsupported_width
+  OP_MUL w -> case w of
+    W64                   -> emit_ bci_OP_MUL_64 []
+    W32                   -> emit_ bci_OP_MUL_32 []
+    W16                   -> emit_ bci_OP_MUL_16 []
+    W8                    -> emit_ bci_OP_MUL_08 []
+    _                     -> unsupported_width
+  OP_SHL w -> case w of
+    W64                   -> emit_ bci_OP_SHL_64 []
+    W32                   -> emit_ bci_OP_SHL_32 []
+    W16                   -> emit_ bci_OP_SHL_16 []
+    W8                    -> emit_ bci_OP_SHL_08 []
+    _                     -> unsupported_width
+  OP_ASR w -> case w of
+    W64                   -> emit_ bci_OP_ASR_64 []
+    W32                   -> emit_ bci_OP_ASR_32 []
+    W16                   -> emit_ bci_OP_ASR_16 []
+    W8                    -> emit_ bci_OP_ASR_08 []
+    _                     -> unsupported_width
+  OP_LSR w -> case w of
+    W64                   -> emit_ bci_OP_LSR_64 []
+    W32                   -> emit_ bci_OP_LSR_32 []
+    W16                   -> emit_ bci_OP_LSR_16 []
+    W8                    -> emit_ bci_OP_LSR_08 []
+    _                     -> unsupported_width
+
+  OP_NEQ w -> case w of
+    W64                   -> emit_ bci_OP_NEQ_64 []
+    W32                   -> emit_ bci_OP_NEQ_32 []
+    W16                   -> emit_ bci_OP_NEQ_16 []
+    W8                    -> emit_ bci_OP_NEQ_08 []
+    _                     -> unsupported_width
+  OP_EQ w -> case w of
+    W64                    -> emit_ bci_OP_EQ_64 []
+    W32                    -> emit_ bci_OP_EQ_32 []
+    W16                    -> emit_ bci_OP_EQ_16 []
+    W8                     -> emit_ bci_OP_EQ_08 []
+    _                      -> unsupported_width
+
+  OP_U_LT w -> case w of
+    W64                  -> emit_ bci_OP_U_LT_64 []
+    W32                  -> emit_ bci_OP_U_LT_32 []
+    W16                  -> emit_ bci_OP_U_LT_16 []
+    W8                   -> emit_ bci_OP_U_LT_08 []
+    _                    -> unsupported_width
+  OP_S_LT w -> case w of
+    W64                  -> emit_ bci_OP_S_LT_64 []
+    W32                  -> emit_ bci_OP_S_LT_32 []
+    W16                  -> emit_ bci_OP_S_LT_16 []
+    W8                   -> emit_ bci_OP_S_LT_08 []
+    _                    -> unsupported_width
+  OP_U_GE w -> case w of
+    W64                  -> emit_ bci_OP_U_GE_64 []
+    W32                  -> emit_ bci_OP_U_GE_32 []
+    W16                  -> emit_ bci_OP_U_GE_16 []
+    W8                   -> emit_ bci_OP_U_GE_08 []
+    _                    -> unsupported_width
+  OP_S_GE w -> case w of
+    W64                  -> emit_ bci_OP_S_GE_64 []
+    W32                  -> emit_ bci_OP_S_GE_32 []
+    W16                  -> emit_ bci_OP_S_GE_16 []
+    W8                   -> emit_ bci_OP_S_GE_08 []
+    _                    -> unsupported_width
+  OP_U_GT w -> case w of
+    W64                  -> emit_ bci_OP_U_GT_64 []
+    W32                  -> emit_ bci_OP_U_GT_32 []
+    W16                  -> emit_ bci_OP_U_GT_16 []
+    W8                   -> emit_ bci_OP_U_GT_08 []
+    _                    -> unsupported_width
+  OP_S_GT w -> case w of
+    W64                  -> emit_ bci_OP_S_GT_64 []
+    W32                  -> emit_ bci_OP_S_GT_32 []
+    W16                  -> emit_ bci_OP_S_GT_16 []
+    W8                   -> emit_ bci_OP_S_GT_08 []
+    _                    -> unsupported_width
+  OP_U_LE w -> case w of
+    W64                  -> emit_ bci_OP_U_LE_64 []
+    W32                  -> emit_ bci_OP_U_LE_32 []
+    W16                  -> emit_ bci_OP_U_LE_16 []
+    W8                   -> emit_ bci_OP_U_LE_08 []
+    _                    -> unsupported_width
+  OP_S_LE w -> case w of
+    W64                  -> emit_ bci_OP_S_LE_64 []
+    W32                  -> emit_ bci_OP_S_LE_32 []
+    W16                  -> emit_ bci_OP_S_LE_16 []
+    W8                   -> emit_ bci_OP_S_LE_08 []
+    _                    -> unsupported_width
+
+  OP_INDEX_ADDR w -> case w of
+    W64                  -> emit_ bci_OP_INDEX_ADDR_64 []
+    W32                  -> emit_ bci_OP_INDEX_ADDR_32 []
+    W16                  -> emit_ bci_OP_INDEX_ADDR_16 []
+    W8                   -> emit_ bci_OP_INDEX_ADDR_08 []
+    _                    -> unsupported_width
+
+  BRK_FUN (InternalBreakpointId tick_mod tickx info_mod infox) -> do
+    let -- cast that checks that round-tripping through Word16 doesn't change the value
+        toW16 x = let r = fromIntegral x :: Word16
+                  in if fromIntegral r == x
+                    then r
+                    else pprPanic "schemeER_wrk: breakpoint tick/info index too large!" (ppr x)
+    p1 <- ptr $ BCOPtrBreakArray tick_mod
+    tick_addr <- lit1 $ BCONPtrFS $ moduleNameFS $ moduleName tick_mod
+    info_addr <- lit1 $ BCONPtrFS $ moduleNameFS $ moduleName info_mod
+    tick_unitid_addr <- lit1 $ BCONPtrFS $ unitIdFS $ moduleUnitId $ tick_mod
+    info_unitid_addr <- lit1 $ BCONPtrFS $ unitIdFS $ moduleUnitId $ info_mod
+    np <- lit1 $ BCONPtrCostCentre (BreakpointId tick_mod tickx)
+    emit_ bci_BRK_FUN [ Op p1
+                     , Op tick_addr, Op info_addr
+                     , Op tick_unitid_addr, Op info_unitid_addr
+                     , SmallOp (toW16 tickx), SmallOp (toW16 infox)
+                     , Op np
+                     ]
+
+  BRK_ALTS active -> emit_ bci_BRK_ALTS [SmallOp (if active then 1 else 0)]
+
 #if MIN_VERSION_rts(1,0,3)
   BCO_NAME name            -> do np <- lit1 (BCONPtrStr name)
                                  emit_ bci_BCO_NAME [Op np]
@@ -750,6 +870,7 @@ assembleI platform i = case i of
 
 
   where
+    unsupported_width = panic "GHC.ByteCode.Asm: Unsupported Width"
     emit_ = emit word_size
 
     literal :: Literal -> m Word
@@ -779,7 +900,6 @@ assembleI platform i = case i of
     literal (LitRubbish {}) = word 0
 
     litlabel fs = lit1 (BCONPtrLbl fs)
-    addr (RemotePtr a) = word (fromIntegral a)
     words ws = lit (fmap BCONPtrWord ws)
     word w = words (OnlyOne w)
     word2 w1 w2 = words (OnlyTwo w1 w2)

@@ -285,6 +285,7 @@ module Control.Exception where
   catchJust :: forall e b a. Exception e => (e -> GHC.Internal.Maybe.Maybe b) -> GHC.Internal.Types.IO a -> (b -> GHC.Internal.Types.IO a) -> GHC.Internal.Types.IO a
   catchNoPropagate :: forall e a. Exception e => GHC.Internal.Types.IO a -> (ExceptionWithContext e -> GHC.Internal.Types.IO a) -> GHC.Internal.Types.IO a
   catches :: forall a. GHC.Internal.Types.IO a -> [Handler a] -> GHC.Internal.Types.IO a
+  displayExceptionWithInfo :: SomeException -> GHC.Internal.Base.String
   evaluate :: forall a. a -> GHC.Internal.Types.IO a
   finally :: forall a b. GHC.Internal.Types.IO a -> GHC.Internal.Types.IO b -> GHC.Internal.Types.IO a
   getMaskingState :: GHC.Internal.Types.IO MaskingState
@@ -322,7 +323,7 @@ module Control.Exception.Backtrace where
   type BacktraceMechanism :: *
   data BacktraceMechanism = CostCentreBacktrace | HasCallStackBacktrace | ExecutionBacktrace | IPEBacktrace
   type Backtraces :: *
-  data Backtraces = ...
+  data Backtraces = Backtraces {btrCostCentre :: GHC.Internal.Maybe.Maybe (GHC.Internal.Ptr.Ptr GHC.Internal.Stack.CCS.CostCentreStack), btrHasCallStack :: GHC.Internal.Maybe.Maybe GHC.Internal.Stack.Types.CallStack, btrExecutionStack :: GHC.Internal.Maybe.Maybe [GHC.Internal.ExecutionStack.Internal.Location], btrIpe :: GHC.Internal.Maybe.Maybe [GHC.Internal.Stack.CloneStack.StackEntry]}
   collectBacktraces :: (?callStack::GHC.Internal.Stack.Types.CallStack) => GHC.Internal.Types.IO Backtraces
   displayBacktraces :: Backtraces -> GHC.Internal.Base.String
   getBacktraceMechanismState :: BacktraceMechanism -> GHC.Internal.Types.IO GHC.Internal.Types.Bool
@@ -452,7 +453,7 @@ module Control.Monad where
     {-# MINIMAL (>>=) #-}
   type MonadFail :: (* -> *) -> Constraint
   class Monad m => MonadFail m where
-    fail :: forall a. GHC.Internal.Base.String -> m a
+    fail :: forall a. GHC.Internal.Stack.Types.HasCallStack => GHC.Internal.Base.String -> m a
     {-# MINIMAL fail #-}
   type MonadPlus :: (* -> *) -> Constraint
   class (GHC.Internal.Base.Alternative m, Monad m) => MonadPlus m where
@@ -492,7 +493,7 @@ module Control.Monad.Fail where
   -- Safety: Safe
   type MonadFail :: (* -> *) -> Constraint
   class GHC.Internal.Base.Monad m => MonadFail m where
-    fail :: forall a. GHC.Internal.Base.String -> m a
+    fail :: forall a. GHC.Internal.Stack.Types.HasCallStack => GHC.Internal.Base.String -> m a
     {-# MINIMAL fail #-}
 
 module Control.Monad.Fix where
@@ -4607,6 +4608,7 @@ module GHC.Base where
   sequence :: forall (m :: * -> *) a. Monad m => [m a] -> m [a]
   setAddrRange# :: Addr# -> Int# -> Int# -> State# RealWorld -> State# RealWorld
   setByteArray# :: forall d. MutableByteArray# d -> Int# -> Int# -> Int# -> State# d -> State# d
+  setOtherThreadAllocationCounter# :: Int64# -> ThreadId# -> State# RealWorld -> State# RealWorld
   setThreadAllocationCounter# :: Int64# -> State# RealWorld -> State# RealWorld
   shiftL# :: Word# -> Int# -> Word#
   shiftRL# :: Word# -> Int# -> Word#
@@ -6665,6 +6667,7 @@ module GHC.Exts where
   seq# :: forall a s. a -> State# s -> (# State# s, a #)
   setAddrRange# :: Addr# -> Int# -> Int# -> State# RealWorld -> State# RealWorld
   setByteArray# :: forall d. MutableByteArray# d -> Int# -> Int# -> Int# -> State# d -> State# d
+  setOtherThreadAllocationCounter# :: Int64# -> ThreadId# -> State# RealWorld -> State# RealWorld
   setThreadAllocationCounter# :: Int64# -> State# RealWorld -> State# RealWorld
   shiftL# :: Word# -> Int# -> Word#
   shiftRL# :: Word# -> Int# -> Word#
@@ -13037,7 +13040,7 @@ module Prelude where
     {-# MINIMAL (>>=) #-}
   type MonadFail :: (* -> *) -> Constraint
   class Monad m => MonadFail m where
-    fail :: forall a. String -> m a
+    fail :: forall a. GHC.Internal.Stack.Types.HasCallStack => String -> m a
     {-# MINIMAL fail #-}
   type Monoid :: * -> Constraint
   class Semigroup a => Monoid a where
@@ -13536,6 +13539,7 @@ module System.Posix.Internals where
   c_lseek :: GHC.Internal.Foreign.C.Types.CInt -> GHC.Internal.System.Posix.Types.COff -> GHC.Internal.Foreign.C.Types.CInt -> GHC.Internal.Types.IO GHC.Internal.System.Posix.Types.COff
   c_mkfifo :: GHC.Internal.Foreign.C.String.Encoding.CString -> GHC.Internal.System.Posix.Types.CMode -> GHC.Internal.Types.IO GHC.Internal.Foreign.C.Types.CInt
   c_open :: CFilePath -> GHC.Internal.Foreign.C.Types.CInt -> GHC.Internal.System.Posix.Types.CMode -> GHC.Internal.Types.IO GHC.Internal.Foreign.C.Types.CInt
+  c_openat :: GHC.Internal.Foreign.C.Types.CInt -> CFilePath -> GHC.Internal.Foreign.C.Types.CInt -> GHC.Internal.System.Posix.Types.CMode -> GHC.Internal.Types.IO GHC.Internal.Foreign.C.Types.CInt
   c_pipe :: GHC.Internal.Ptr.Ptr GHC.Internal.Foreign.C.Types.CInt -> GHC.Internal.Types.IO GHC.Internal.Foreign.C.Types.CInt
   c_read :: GHC.Internal.Foreign.C.Types.CInt -> GHC.Internal.Ptr.Ptr GHC.Internal.Word.Word8 -> GHC.Internal.Foreign.C.Types.CSize -> GHC.Internal.Types.IO GHC.Internal.System.Posix.Types.CSsize
   c_s_isblk :: GHC.Internal.System.Posix.Types.CMode -> GHC.Internal.Foreign.C.Types.CInt

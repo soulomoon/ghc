@@ -55,6 +55,7 @@ import GHC.Types.SourceText
 import GHC.Types.SrcLoc
 import GHC.Types.Tickish (CoreTickish)
 import GHC.Types.Unique.Set (UniqSet)
+import GHC.Types.ThLevelIndex
 import GHC.Core.ConLike ( conLikeName, ConLike )
 import GHC.Unit.Module (ModuleName)
 import GHC.Utils.Misc
@@ -78,7 +79,7 @@ import Data.Foldable ( toList )
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as NE
 import Data.Void (Void)
-
+import qualified Data.Set as S
 {- *********************************************************************
 *                                                                      *
                 Expressions proper
@@ -956,7 +957,7 @@ ppr_expr (HsIf _ e1 e2 e3)
 ppr_expr (HsMultiIf _ alts)
   = hang (text "if") 3  (vcat $ toList $ NE.map ppr_alt alts)
   where ppr_alt (L _ (GRHS _ guards expr)) =
-          hang vbar 2 (hang (interpp'SP guards) 2 (text "->" <+> pprDeeper (ppr expr)))
+          hang vbar 2 (hang (interpp'SP guards) 2 (arrow <+> pprDeeper (ppr expr)))
         ppr_alt (L _ (XGRHS x)) = ppr x
 
 -- special case: let ... in let ...
@@ -1004,7 +1005,10 @@ ppr_expr (ArithSeq _ _ info) = brackets (ppr info)
 ppr_expr (HsTypedSplice ext e)   =
     case ghcPass @p of
       GhcPs -> pprTypedSplice Nothing e
-      GhcRn -> pprTypedSplice (Just ext) e
+      GhcRn ->
+        case ext of
+          HsTypedSpliceNested n -> pprTypedSplice (Just n) e
+          HsTypedSpliceTop {}   -> pprTypedSplice Nothing e
       GhcTc -> pprTypedSplice Nothing e
 ppr_expr (HsUntypedSplice ext s) =
     case ghcPass @p of
@@ -1024,12 +1028,14 @@ ppr_expr (HsUntypedBracket b q)
     GhcPs -> ppr q
     GhcRn -> case b of
       [] -> ppr q
-      ps -> ppr q $$ text "pending(rn)" <+> ppr ps
+      ps -> ppr q $$ whenPprDebug (text "pending(rn)" <+> ppr (map ppr_nested_splice ps))
     GhcTc | HsBracketTc rnq  _ty _wrap ps <- b ->
       ppr rnq `ppr_with_pending_tc_splices` ps
+  where
+    ppr_nested_splice (PendingRnSplice splice_name expr) = pprUntypedSplice False (Just splice_name) expr
 
 ppr_expr (HsProc _ pat (L _ (HsCmdTop _ cmd)))
-  = hsep [text "proc", ppr pat, text "->", ppr cmd]
+  = hsep [text "proc", ppr pat, arrow, ppr cmd]
 
 ppr_expr (HsStatic _ e)
   = hsep [text "static", ppr e]
@@ -1724,7 +1730,7 @@ isSingletonMatchGroup matches
 matchGroupArity :: MatchGroup (GhcPass id) body -> Arity
 -- This is called before type checking, when mg_arg_tys is not set
 matchGroupArity MG { mg_alts = L _ [] } = 1 -- See Note [Empty mg_alts]
-matchGroupArity MG { mg_alts = L _ (alt1 : _) } = count (isVisArgPat . unLoc) (hsLMatchPats alt1)
+matchGroupArity MG { mg_alts = L _ (alt1 : _) } = count isVisArgLPat (hsLMatchPats alt1)
 
 hsLMatchPats :: LMatch (GhcPass id) body -> [LPat (GhcPass id)]
 hsLMatchPats (L _ (Match { m_pats = L _ pats })) = pats
@@ -1844,10 +1850,10 @@ pp_rhs ctxt rhs = matchSeparator ctxt <+> pprDeeper (ppr rhs)
 
 matchSeparator :: HsMatchContext fn -> SDoc
 matchSeparator FunRhs{}         = text "="
-matchSeparator CaseAlt          = text "->"
-matchSeparator LamAlt{}         = text "->"
-matchSeparator IfAlt            = text "->"
-matchSeparator ArrowMatchCtxt{} = text "->"
+matchSeparator CaseAlt          = arrow
+matchSeparator LamAlt{}         = arrow
+matchSeparator IfAlt            = arrow
+matchSeparator ArrowMatchCtxt{} = arrow
 matchSeparator PatBindRhs       = text "="
 matchSeparator PatBindGuards    = text "="
 matchSeparator StmtCtxt{}       = text "<-"
@@ -2209,8 +2215,14 @@ data HsUntypedSpliceResult thing  -- 'thing' can be HsExpr or HsType
       }
   | HsUntypedSpliceNested SplicePointName -- A unique name to identify this splice point
 
-type instance XTypedSplice   GhcPs = EpToken "$$"
-type instance XTypedSplice   GhcRn = SplicePointName
+-- See Note [Lifecycle of an untyped splice, and PendingRnSplice]
+-- for an explanation of the Template Haskell extension points.
+data HsTypedSpliceResult
+  = HsTypedSpliceTop
+  | HsTypedSpliceNested SplicePointName
+
+type instance XTypedSplice   GhcPs = NoExtField
+type instance XTypedSplice   GhcRn = HsTypedSpliceResult
 type instance XTypedSplice   GhcTc = DelayedSplice
 
 type instance XUntypedSplice GhcPs = NoExtField
@@ -2219,12 +2231,25 @@ type instance XUntypedSplice GhcTc = DataConCantHappen
 
 -- HsUntypedSplice
 type instance XUntypedSpliceExpr GhcPs = EpToken "$"
-type instance XUntypedSpliceExpr GhcRn = EpToken "$"
+type instance XUntypedSpliceExpr GhcRn = HsUserSpliceExt
 type instance XUntypedSpliceExpr GhcTc = DataConCantHappen
 
-type instance XQuasiQuote        p = NoExtField
+type instance XTypedSpliceExpr GhcPs = EpToken "$$"
+type instance XTypedSpliceExpr GhcRn = NoExtField
+type instance XTypedSpliceExpr GhcTc = NoExtField
 
-type instance XXUntypedSplice    p = DataConCantHappen
+type instance XQuasiQuote        GhcPs = NoExtField
+type instance XQuasiQuote        GhcRn = HsQuasiQuoteExt
+type instance XQuasiQuote        GhcTc = DataConCantHappen
+
+
+type instance XXUntypedSplice    GhcPs = DataConCantHappen
+type instance XXUntypedSplice    GhcRn = HsImplicitLiftSplice
+type instance XXUntypedSplice    GhcTc = DataConCantHappen
+
+type instance XXTypedSplice    GhcPs = DataConCantHappen
+type instance XXTypedSplice    GhcRn = HsImplicitLiftSplice
+type instance XXTypedSplice    GhcTc = DataConCantHappen
 
 -- See Note [Running typed splices in the zonker]
 -- These are the arguments that are passed to `GHC.Tc.Gen.Splice.runTopSplice`
@@ -2251,21 +2276,51 @@ data UntypedSpliceFlavour
   | UntypedDeclSplice
   deriving Data
 
--- | Pending Renamer Splice
-data PendingRnSplice
-  = PendingRnSplice UntypedSpliceFlavour SplicePointName (LHsExpr GhcRn)
+
+-- See Note [Lifecycle of an untyped splice, and PendingRnSplice]
+-- A 'PendingRnSplice' is lifted from an untyped quotation and then typechecked.
+data PendingRnSplice = PendingRnSplice SplicePointName (HsUntypedSplice GhcRn)
+
+instance Outputable PendingRnSplice where
+  ppr (PendingRnSplice sp expr) =
+    angleBrackets (ppr sp <> comma <+> pprUntypedSplice False Nothing expr)
 
 -- | Pending Type-checker Splice
+-- See Note [Lifecycle of an untyped splice, and PendingRnSplice]
 data PendingTcSplice
   = PendingTcSplice SplicePointName (LHsExpr GhcTc)
 
+-- | Information about an implicit lift, discovered by the renamer
+-- See Note [Lifecycle of an untyped splice, and PendingRnSplice]
+data HsImplicitLiftSplice =
+        HsImplicitLiftSplice
+          { implicit_lift_bind_lvl :: S.Set ThLevelIndex
+          , implicit_lift_used_lvl :: ThLevelIndex
+          , implicit_lift_gre :: Maybe GlobalRdrElt
+          , implicit_lift_lid :: LIdOccP GhcRn
+          }
 
-pprPendingSplice :: (OutputableBndrId p)
-                 => SplicePointName -> LHsExpr (GhcPass p) -> SDoc
-pprPendingSplice n e = angleBrackets (ppr n <> comma <+> ppr (stripParensLHsExpr e))
+-- | Information about a user-written splice, discovered by the renamer
+-- See Note [Lifecycle of an untyped splice, and PendingRnSplice]
+data HsUserSpliceExt =
+  HsUserSpliceExt
+    { user_splice_flavour :: UntypedSpliceFlavour
+    }
 
-pprTypedSplice :: (OutputableBndrId p) => Maybe SplicePointName -> LHsExpr (GhcPass p) -> SDoc
-pprTypedSplice n e = ppr_splice (text "$$") n e
+-- | Information about a quasi-quoter, discovered by the renamer
+-- See Note [Lifecycle of an untyped splice, and PendingRnSplice]
+data HsQuasiQuoteExt =
+  HsQuasiQuoteExt
+    { quasi_quote_flavour :: UntypedSpliceFlavour
+    }
+
+
+pprTypedSplice :: forall p . (OutputableBndrId p) => Maybe SplicePointName -> HsTypedSplice (GhcPass p) -> SDoc
+pprTypedSplice n (HsTypedSpliceExpr _ e) = ppr_splice (text "$$") n e
+pprTypedSplice n (XTypedSplice p) =
+  case ghcPass @p of
+    GhcRn -> case p of
+              HsImplicitLiftSplice _ _ _ lid -> ppr lid <+> whenPprDebug (maybe empty (brackets . ppr) n)
 
 pprUntypedSplice :: forall p. (OutputableBndrId p)
                  => Bool -- Whether to precede the splice with "$"
@@ -2274,7 +2329,11 @@ pprUntypedSplice :: forall p. (OutputableBndrId p)
                  -> SDoc
 pprUntypedSplice True  n (HsUntypedSpliceExpr _ e) = ppr_splice (text "$") n e
 pprUntypedSplice False n (HsUntypedSpliceExpr _ e) = ppr_splice empty n e
-pprUntypedSplice _     _ (HsQuasiQuote _ q s)      = ppr_quasi q (unLoc s)
+pprUntypedSplice _     _ (HsQuasiQuote _ q s)      = ppr_quasi (unLoc q) (unLoc s)
+pprUntypedSplice _     _ (XUntypedSplice x) =
+  case ghcPass @p of
+    GhcRn -> case x of
+              HsImplicitLiftSplice _ _ _ lid -> ppr lid
 
 ppr_quasi :: OutputableBndr p => p -> FastString -> SDoc
 ppr_quasi quoter quote = char '[' <> ppr quoter <> vbar <>
@@ -2344,15 +2403,12 @@ thBrackets pp_kind pp_body = char '[' <> pp_kind <> vbar <+>
 thTyBrackets :: SDoc -> SDoc
 thTyBrackets pp_body = text "[||" <+> pp_body <+> text "||]"
 
-instance Outputable PendingRnSplice where
-  ppr (PendingRnSplice _ n e) = pprPendingSplice n e
-
 instance Outputable PendingTcSplice where
-  ppr (PendingTcSplice n e) = pprPendingSplice n e
+  ppr (PendingTcSplice n e) = angleBrackets (ppr n <> comma <+> ppr (stripParensLHsExpr e))
 
 ppr_with_pending_tc_splices :: SDoc -> [PendingTcSplice] -> SDoc
 ppr_with_pending_tc_splices x [] = x
-ppr_with_pending_tc_splices x ps = x $$ text "pending(tc)" <+> ppr ps
+ppr_with_pending_tc_splices x ps = x $$ whenPprDebug (text "pending(tc)" <+> ppr ps)
 
 {-
 ************************************************************************

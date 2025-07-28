@@ -5,6 +5,7 @@ GHC.Builtin.Types
 GHC.Builtin.Types.Literals
 GHC.Builtin.Types.Prim
 GHC.Builtin.Uniques
+GHC.ByteCode.Breakpoints
 GHC.ByteCode.Types
 GHC.Cmm.BlockId
 GHC.Cmm.CLabel
@@ -110,6 +111,8 @@ GHC.Hs.Pat
 GHC.Hs.Specificity
 GHC.Hs.Type
 GHC.Hs.Utils
+GHC.HsToCore.Breakpoints
+GHC.HsToCore.Ticks
 GHC.Iface.Errors.Types
 GHC.Iface.Ext.Fields
 GHC.Iface.Flags
@@ -181,6 +184,7 @@ GHC.Types.SourceFile
 GHC.Types.SourceText
 GHC.Types.SptEntry
 GHC.Types.SrcLoc
+GHC.Types.ThLevelIndex
 GHC.Types.Tickish
 GHC.Types.TyThing
 GHC.Types.Unique
@@ -244,6 +248,7 @@ Language.Haskell.Syntax.Decls
 Language.Haskell.Syntax.Expr
 Language.Haskell.Syntax.Extension
 Language.Haskell.Syntax.ImpExp
+Language.Haskell.Syntax.ImpExp.IsBoot
 Language.Haskell.Syntax.Lit
 Language.Haskell.Syntax.Module.Name
 Language.Haskell.Syntax.Pat

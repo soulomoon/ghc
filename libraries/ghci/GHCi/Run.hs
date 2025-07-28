@@ -1,5 +1,5 @@
 {-# LANGUAGE GADTs, RecordWildCards, MagicHash, ScopedTypeVariables, CPP,
-    UnboxedTuples, LambdaCase #-}
+    UnboxedTuples, LambdaCase, UnliftedFFITypes #-}
 {-# OPTIONS_GHC -fno-warn-name-shadowing #-}
 
 -- |
@@ -20,6 +20,7 @@ import GHCi.InfoTable
 #endif
 
 import qualified GHC.InfoProv as InfoProv
+import GHCi.Debugger
 import GHCi.FFI
 import GHCi.Message
 import GHCi.ObjLink
@@ -33,6 +34,7 @@ import Control.DeepSeq
 import Control.Exception
 import Control.Monad
 import Data.ByteString (ByteString)
+import qualified Data.ByteString.Short as BS
 import qualified Data.ByteString.Unsafe as B
 import GHC.Exts
 import qualified GHC.Exts.Heap as Heap
@@ -73,7 +75,7 @@ run m = case m of
   UnloadObj str -> unloadObj str
   AddLibrarySearchPath str -> toRemotePtr <$> addLibrarySearchPath str
   RemoveLibrarySearchPath ptr -> removeLibrarySearchPath (fromRemotePtr ptr)
-  MkConInfoTable tc ptrs nptrs tag ptrtag desc ->
+  MkConInfoTable (ConInfoTable tc ptrs nptrs tag ptrtag desc) ->
     toRemotePtr <$> mkConInfoTable tc ptrs nptrs tag ptrtag desc
   ResolveObjs -> resolveObjs
   FindSystemLibrary str -> findSystemLibrary str
@@ -95,7 +97,6 @@ run m = case m of
   MkCostCentres mod ccs -> mkCostCentres mod ccs
   CostCentreStackInfo ptr -> ccsToStrings (fromRemotePtr ptr)
   NewBreakArray sz -> mkRemoteRef =<< newBreakArray sz
-  NewBreakModule name -> newModuleName name
   SetupBreakpoint ref ix cnt -> do
     arr <- localRef ref;
     _ <- setupBreakpoint arr ix cnt
@@ -197,7 +198,7 @@ doSeq ref = do
 resumeSeq :: RemoteRef (ResumeContext ()) -> IO (EvalStatus ())
 resumeSeq hvref = do
     ResumeContext{..} <- localRef hvref
-    withBreakAction evalOptsSeq resumeBreakMVar resumeStatusMVar $
+    withBreakAction evalOptsSeq resumeBreakMVar resumeStatusMVar (Just resumeThreadId) $
       mask_ $ do
         putMVar resumeBreakMVar () -- this awakens the stopped thread...
         redirectInterrupts resumeThreadId $ takeMVar resumeStatusMVar
@@ -206,6 +207,7 @@ evalOptsSeq :: EvalOpts
 evalOptsSeq = EvalOpts
               { useSandboxThread = True
               , singleStep = False
+              , stepOut    = False
               , breakOnException = False
               , breakOnError = False
               }
@@ -225,7 +227,7 @@ sandboxIO opts io = do
   -- We are running in uninterruptibleMask
   breakMVar <- newEmptyMVar
   statusMVar <- newEmptyMVar
-  withBreakAction opts breakMVar statusMVar $ do
+  withBreakAction opts breakMVar statusMVar Nothing $ do
     let runIt = measureAlloc $ tryEval $ rethrow opts $ clearCCS io
     if useSandboxThread opts
        then do
@@ -320,22 +322,30 @@ tryEval io = do
 -- resets everything when the computation has stopped running.  This
 -- is a not-very-good way to ensure that only the interactive
 -- evaluation should generate breakpoints.
-withBreakAction :: EvalOpts -> MVar () -> MVar (EvalStatus b) -> IO a -> IO a
-withBreakAction opts breakMVar statusMVar act
+withBreakAction :: EvalOpts -> MVar ()
+                -> MVar (EvalStatus b)
+                -> Maybe ThreadId -- ^ If resuming, the current threadId
+                -> IO a -> IO a
+withBreakAction opts breakMVar statusMVar mtid act
  = bracket setBreakAction resetBreakAction (\_ -> act)
  where
    setBreakAction = do
      stablePtr <- newStablePtr onBreak
      poke breakPointIOAction stablePtr
      when (breakOnException opts) $ poke exceptionFlag 1
-     when (singleStep opts) $ setStepFlag
+     when (singleStep opts) rts_enableStopNextBreakpointAll
+     when (stepOut opts) $ do
+      case mtid of
+        Nothing -> rts_enableStopNextBreakpointAll -- just enable single-step when no thread is stopped
+        Just (ThreadId tid) -> do
+          rts_enableStopAfterReturn tid
      return stablePtr
         -- Breaking on exceptions is not enabled by default, since it
         -- might be a bit surprising.  The exception flag is turned off
         -- as soon as it is hit, or in resetBreakAction below.
 
    onBreak :: BreakpointCallback
-   onBreak tick_mod# tickx# info_mod# infox# is_exception apStack = do
+   onBreak tick_mod# tick_mod_uid# tickx# info_mod# info_mod_uid# infox# is_exception apStack = do
      tid <- myThreadId
      let resume = ResumeContext
            { resumeBreakMVar = breakMVar
@@ -349,15 +359,20 @@ withBreakAction opts breakMVar statusMVar act
        then pure Nothing
        else do
          tick_mod <- peekCString (Ptr tick_mod#)
+         tick_mod_uid <- BS.packCString (Ptr tick_mod_uid#)
          info_mod <- peekCString (Ptr info_mod#)
-         pure (Just (EvalBreakpoint tick_mod (I# tickx#) info_mod (I# infox#)))
+         info_mod_uid <- BS.packCString (Ptr info_mod_uid#)
+         pure (Just (EvalBreakpoint tick_mod tick_mod_uid (I# tickx#) info_mod info_mod_uid (I# infox#)))
      putMVar statusMVar $ EvalBreak apStack_r breakpoint resume_r ccs
      takeMVar breakMVar
 
    resetBreakAction stablePtr = do
      poke breakPointIOAction noBreakStablePtr
      poke exceptionFlag 0
-     resetStepFlag
+     rts_disableStopNextBreakpointAll
+     case mtid of
+      Just (ThreadId tid) -> rts_disableStopAfterReturn tid
+      _                   -> pure ()
      freeStablePtr stablePtr
 
 resumeStmt
@@ -365,7 +380,7 @@ resumeStmt
   -> IO (EvalStatus [HValueRef])
 resumeStmt opts hvref = do
   ResumeContext{..} <- localRef hvref
-  withBreakAction opts resumeBreakMVar resumeStatusMVar $
+  withBreakAction opts resumeBreakMVar resumeStatusMVar (Just resumeThreadId) $
     mask_ $ do
       putMVar resumeBreakMVar () -- this awakens the stopped thread...
       redirectInterrupts resumeThreadId $ takeMVar resumeStatusMVar
@@ -390,32 +405,12 @@ abandonStmt hvref = do
   _ <- takeMVar resumeStatusMVar
   return ()
 
-foreign import ccall "&rts_stop_next_breakpoint" stepFlag      :: Ptr CInt
-foreign import ccall "&rts_stop_on_exception"    exceptionFlag :: Ptr CInt
-
-setStepFlag :: IO ()
-setStepFlag = poke stepFlag 1
-resetStepFlag :: IO ()
-resetStepFlag = poke stepFlag 0
-
-type BreakpointCallback
-     = Addr#   -- pointer to the breakpoint tick module name
-    -> Int#    -- breakpoint tick index
-    -> Addr#   -- pointer to the breakpoint info module name
-    -> Int#    -- breakpoint info index
-    -> Bool    -- exception?
-    -> HValue  -- the AP_STACK, or exception
-    -> IO ()
-
-foreign import ccall "&rts_breakpoint_io_action"
-   breakPointIOAction :: Ptr (StablePtr BreakpointCallback)
-
 noBreakStablePtr :: StablePtr BreakpointCallback
 noBreakStablePtr = unsafePerformIO $ newStablePtr noBreakAction
 
 noBreakAction :: BreakpointCallback
-noBreakAction _ _ _ _ False _ = putStrLn "*** Ignoring breakpoint"
-noBreakAction _ _ _ _ True  _ = return () -- exception: just continue
+noBreakAction _ _ _ _ _ _ False _ = putStrLn "*** Ignoring breakpoint"
+noBreakAction _ _ _ _ _ _ True  _ = return () -- exception: just continue
 
 -- Malloc and copy the bytes.  We don't have any way to monitor the
 -- lifetime of this memory, so it just leaks.
@@ -448,10 +443,6 @@ foreign import ccall unsafe "mkCostCentre"
 #else
 mkCostCentres _ _ = return []
 #endif
-
-newModuleName :: String -> IO (RemotePtr BreakModule)
-newModuleName name =
-  castRemotePtr . toRemotePtr <$> newCString name
 
 getIdValFromApStack :: HValue -> Int -> IO (Maybe HValue)
 getIdValFromApStack apStack (I# stackDepth) = do

@@ -322,7 +322,7 @@ splice to separate the module and force the desired order of kind-checking:
   data D1 = MkD1 !(F Int)     -- now (F Int) surely gets unpacked
 
 The current version of GHC is more predictable. Neither the (Complex Double) nor
-the (F Int) example gets unpacking, the type/data instance is put into a
+the (F Int) example gets unpacking unless the type/data instance is put into a
 separate HsGroup, either with $(return []) or by placing it in another module
 altogether. This is a direct result of placing instances after the other SCCs,
 as described in Note [Put instances at the end] in GHC.Rename.Module
@@ -449,11 +449,20 @@ tcTyClGroupsPass all_gs thing_inside = go True ttcgs_zero mempty nilOL all_gs
               -- pass, the current group's lexical dependencies must have been
               -- satisfied by the preceding groups; no need for the ready check,
               -- this avoids some lookups in tcg_env
+
+          -- See Note [Expedient use of diagnostics in tcTyClGroupsPass]
+          set_opts action
+            | strict    = setWOptM Opt_WarnUnusableUnpackPragmas action
+            | otherwise = action
+          validate _ msgs _
+            | strict    = not (unpackErrorsFound msgs)
+            | otherwise = True
+
       if not ready then return on_blocked else
-        tryTcDiscardingErrs' (\_ msgs _ -> not (strict && unpackErrorsFound msgs))
+        tryTcDiscardingErrs' validate
                              (return on_flawed)
                              (return on_failed)
-                             (on_success <$> tcTyClGroup g)
+                             (on_success <$> set_opts (tcTyClGroup g))
 
 data TcTyClGroupsStats =
   TcTyClGroupsStats
@@ -479,14 +488,35 @@ instance Outputable TcTyClGroupsStats where
          , text "n_failed  =" <+> ppr (ttcgs_n_failed  stats)
          , text "n_flawed  =" <+> ppr (ttcgs_n_flawed  stats) ]
 
+-- See Note [Expedient use of diagnostics in tcTyClGroupsPass]
 unpackErrorsFound :: Messages TcRnMessage -> Bool
 unpackErrorsFound = any is_unpack_error
   where
     is_unpack_error :: TcRnMessage -> Bool
     is_unpack_error (TcRnMessageWithInfo _ (TcRnMessageDetailed _ msg)) = is_unpack_error msg
     is_unpack_error (TcRnWithHsDocContext _ msg) = is_unpack_error msg
-    is_unpack_error (TcRnBadFieldAnnotation _ _ BackpackUnpackAbstractType) = True
+    is_unpack_error (TcRnBadFieldAnnotation _ _ UnusableUnpackPragma) = True
     is_unpack_error _ = False
+
+{- Note [Expedient use of diagnostics in tcTyClGroupsPass]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In tcTyClGroupsPass.go with strict=True, we want to skip "flawed" groups, i.e.
+groups with unusable unpack pragmas, as explained in Note [Retrying TyClGroups].
+To detect these unusable {-# UNPACK #-} pragmas, we currently piggy-back on the
+diagnostics infrastructure:
+
+  1. (setWOptM Opt_WarnUnusableUnpackPragmas) to enable the warning.
+     The warning is on by default, but the user may have disabled it with
+     -Wno-unusable-unpack-pragmas, in which case we need to turn it back on.
+
+  2. (unpackErrorsFound msgs) to check if UnusableUnpackPragma is one of the
+     collected diagnostics.  This is somewhat unpleasant because of the need to
+     recurse into TcRnMessageWithInfo and TcRnWithHsDocContext.
+
+Arguably, this is not a principled solution, because diagnostics are meant for
+the user and here we inspect them to determine the order of type-checking. The
+only reason for the current setup is that it was the easy thing to do.
+-}
 
 isReadyTyClGroup :: TcGblEnv -> TyClGroup GhcRn -> Bool
 isReadyTyClGroup tcg_env TyClGroup{group_ext = deps} =
@@ -2179,14 +2209,16 @@ kcConDecl new_or_data tc_res_kind
 kcConDecl new_or_data _tc_res_kind
                       -- NB: _tc_res_kind is unused.   See (KCD3) in
                       -- Note [kcConDecls: kind-checking data type decls]
-          (ConDeclGADT { con_names = names, con_bndrs = L _ outer_bndrs
-                       , con_mb_cxt = cxt, con_g_args = args, con_res_ty = res_ty })
+          (ConDeclGADT { con_names = names
+                       , con_outer_bndrs = L _ outer_bndrs
+                       , con_inner_bndrs = inner_bndrs
+                       , con_mb_cxt = cxt
+                       , con_g_args = args
+                       , con_res_ty = res_ty })
   = -- See Note [kcConDecls: kind-checking data type decls]
     addErrCtxt (DataConDefCtxt names) $
-    discardResult                      $
     -- Not sure this is right, should just extend rather than skolemise but no test
-    bindOuterSigTKBndrs_Tv outer_bndrs $
-        -- Why "_Tv"?  See Note [Using TyVarTvs for kind-checking GADTs]
+    bind_con_tvbs outer_bndrs inner_bndrs $
     do { _ <- tcHsContext cxt
        ; traceTc "kcConDecl:GADT {" (ppr names $$ ppr res_ty)
        ; con_res_kind <- newOpenTypeKind
@@ -2200,6 +2232,12 @@ kcConDecl new_or_data _tc_res_kind
 
        ; traceTc "kcConDecl:GADT }" (ppr names $$ ppr arg_exp_kind)
        ; return () }
+  where
+    bind_con_tvbs outer_bndrs inner_bndrs thing_inside
+      -- Why "_Tv"? See Note [Using TyVarTvs for kind-checking GADTs]
+      = discardResult $ bindOuterSigTKBndrs_Tv outer_bndrs $
+                        bindExplicitTKBndrs_Tv (concatMap hsForAllTelescopeBndrs inner_bndrs) $
+                        thing_inside
 
 {- Note [kcConDecls: kind-checking data type decls]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -4046,7 +4084,7 @@ tcConDecl new_or_data dd_info rep_tycon tc_bndrs res_kind tag_map
                 -- For H98 datatypes, the user-written tyvar binders are precisely
                 -- the universals followed by the existentials.
                 -- See Note [DataCon user type variable binders] in GHC.Core.DataCon.
-             user_tvbs = univ_tvbs ++ ex_tvbs
+             user_tvbs = tyVarSpecToBinders $ univ_tvbs ++ ex_tvbs
              user_res_ty = mkDDHeaderTy dd_info rep_tycon tc_bndrs
 
        ; traceTc "tcConDecl 2" (ppr name)
@@ -4070,16 +4108,17 @@ tcConDecl new_or_data dd_info rep_tycon tc_bndrs _res_kind tag_map
   -- NB: don't use res_kind here, as it's ill-scoped. Instead,
   -- we get the res_kind by typechecking the result type.
           (ConDeclGADT { con_names = names
-                       , con_bndrs = L _ outer_hs_bndrs
+                       , con_outer_bndrs = L _ outer_bndrs
+                       , con_inner_bndrs = inner_bndrs
                        , con_mb_cxt = cxt, con_g_args = hs_args
                        , con_res_ty = hs_res_ty })
   = addErrCtxt (DataConDefCtxt names) $
     do { traceTc "tcConDecl 1 gadt" (ppr names)
        ; let L _ name :| _ = names
        ; skol_info <- mkSkolemInfo (DataConSkol name)
-       ; (tclvl, wanted, (outer_bndrs, (ctxt, arg_tys, res_ty, field_lbls, stricts)))
+       ; (tclvl, wanted, (tvbs, (ctxt, arg_tys, res_ty, field_lbls, stricts)))
            <- pushLevelAndSolveEqualitiesX "tcConDecl:GADT" $
-              tcOuterTKBndrs skol_info outer_hs_bndrs       $
+              tcGadtConTyVarBndrs skol_info outer_bndrs inner_bndrs $
               do { ctxt <- tcHsContext cxt
                  ; (res_ty, res_kind) <- tcInferLHsTypeKind hs_res_ty
                          -- See Note [GADT return kinds]
@@ -4106,18 +4145,15 @@ tcConDecl new_or_data dd_info rep_tycon tc_bndrs _res_kind tag_map
                  ; return (ctxt, arg_tys, res_ty, field_lbls, stricts)
                  }
 
-       ; outer_bndrs <- scopedSortOuter outer_bndrs
-       ; let outer_tv_bndrs = outerTyVarBndrs outer_bndrs
-
        ; tkvs <- kindGeneralizeAll skol_info
-                    (mkInvisForAllTys outer_tv_bndrs $
-                     tcMkPhiTy ctxt                  $
-                     tcMkScaledFunTys arg_tys        $
+                    (mkForAllTys tvbs         $
+                     tcMkPhiTy ctxt           $
+                     tcMkScaledFunTys arg_tys $
                      res_ty)
        ; traceTc "tcConDecl:GADT" (ppr names $$ ppr res_ty $$ ppr tkvs)
        ; reportUnsolvedEqualities skol_info tkvs tclvl wanted
 
-       ; let tvbndrs =  mkTyVarBinders InferredSpec tkvs ++ outer_tv_bndrs
+       ; let tvbndrs = mkTyVarBinders Inferred tkvs ++ tvbs
 
        -- Zonk to Types
        ; (tvbndrs, arg_tys, ctxt, res_ty) <- initZonkEnv NoFlexi $
@@ -4404,11 +4440,11 @@ errors reported in one pass.  See #7175, and #10836.
 rejigConRes :: [KnotTied TyConBinder]  -- Template for result type; e.g.
             -> KnotTied Type           -- data instance T [a] b c ...
                                        --      gives template ([a,b,c], T [a] b c)
-            -> [InvisTVBinder]    -- The constructor's type variables (both inferred and user-written)
+            -> [TyVarBinder]      -- The constructor's type variables (both inferred and user-written)
             -> KnotTied Type      -- res_ty
             -> ([TyVar],          -- Universal
                 [TyVar],          -- Existential (distinct OccNames from univs)
-                [InvisTVBinder],  -- The constructor's rejigged, user-written
+                [TyVarBinder],    -- The constructor's rejigged, user-written
                                   -- type variables
                 [EqSpec],         -- Equality predicates
                 Subst)            -- Substitution to apply to argument types
@@ -5123,7 +5159,7 @@ checkValidDataCon dflags existential_ok tc con
                -- warn in this case (it gives users the wrong idea about whether
                -- or not UNPACK on abstract types is supported; it is!)
                , isHomeUnitDefinite (hsc_home_unit hsc_env)
-               = addDiagnosticTc (bad_bang n BackpackUnpackAbstractType)
+               = addDiagnosticTc (bad_bang n UnusableUnpackPragma)
 
                | otherwise
                = return ()
