@@ -81,7 +81,7 @@ import GHC.Iface.Recomp    ( RecompileRequired(..), CompileReason(..) )
 
 import GHC.Data.Bag        ( listToBag )
 import GHC.Data.Graph.Directed
-import GHC.Data.Maybe      ( expectJust, whenIsJust )
+import GHC.Data.Maybe      ( expectJust )
 
 import GHC.Utils.Exception ( throwIO, SomeAsyncException )
 import GHC.Utils.Outputable
@@ -137,8 +137,6 @@ import qualified GHC.Data.Maybe as M
 import GHC.Data.Graph.Directed.Reachability
 import qualified GHC.Unit.Home.Graph as HUG
 import GHC.Unit.Home.PackageTable
-import Debug.Trace (trace)
-import GHC.Tc.Errors.Types (NotClosedReason(NotTypeClosed))
 
 -- -----------------------------------------------------------------------------
 -- Loading the program
