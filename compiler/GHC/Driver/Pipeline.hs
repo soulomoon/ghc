@@ -330,7 +330,7 @@ afterTypecheckOne mHscMessage
    -- Initialise plugins here for any plugins enabled locally for a module.
    plugin_hsc_env <- initializePlugins hsc_env
    let pipe_env = mkPipeEnv NoStop input_fn Nothing pipelineOutput
-   status <- hscRecompStatus mHscMessage NotTypecheck plugin_hsc_env upd_summary
+   _status <- hscRecompStatus mHscMessage NotTypecheck plugin_hsc_env upd_summary
                 mb_old_iface mb_old_linkable (mod_index, nmods)
    let pipeline = afterTypeCheckPipeline pipe_env (setDumpPrefix pipe_env plugin_hsc_env, upd_summary, needComilePlan)
    (iface, linkable) <- runPipeline (hsc_hooks plugin_hsc_env) pipeline
@@ -410,7 +410,7 @@ typeCheckOne mHscMessage
 
    needComilePlan <- runPipeline (hsc_hooks plugin_hsc_env) pipeline
    case needComilePlan of
-      NeedCompilePlan (FrontendTypecheck tc_result) warnings mb_old_hash -> do
+      NeedCompilePlan (FrontendTypecheck tc_result) _warnings _mb_old_hash -> do
         (iface, details) <- hscSimpleIface plugin_hsc_env Nothing tc_result summary
         return $! (HomeModInfo iface details emptyHomeModInfoLinkable, needComilePlan)
       DonNeedCompil iface linkable -> do
